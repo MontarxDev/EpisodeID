@@ -113,7 +113,21 @@ Season 01/Star Wars The Clone Wars - S01E01 - Ambush.mkv
 
 ---
 
-## Matching strategy
+## Matching strategy (no LLM required)
+
+EpisodeID does **not** compare your file to official subtitle downloads. Free path:
+
+1. Extract a dialogue sample from the MKV (text track or **OCR** of eng image subs)
+2. Load TMDB episode **titles + plots** (cached after first fetch)
+3. Score sample vs each plot (token overlap + RapidFuzz)
+4. Assign unique SxxExx across the folder; show confidence before rename
+
+**Tips for disc rips (Clone Wars S1D1 etc.):**
+
+- Use **Match season: Season 01 only** — hugely reduces wrong-season hits  
+- Hover a row to see the **extracted dialogue sample** and OCR quality  
+- Scan logs: `~/.local/share/episodeid/scans/`  
+- Mega “all episodes” titles and tiny extras are skipped by size filter  
 
 | Mode | When |
 |------|------|
@@ -124,7 +138,8 @@ Confidence bands (defaults):
 
 - **≥ 70%** high (green, selected)  
 - **55–69%** review (yellow, selected)  
-- **&lt; 55%** low (red, unselected)
+- **&lt; 55%** low (red, unselected)  
+- Poor OCR quality refuses a match instead of guessing
 
 ---
 

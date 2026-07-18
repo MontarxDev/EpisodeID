@@ -63,8 +63,19 @@ def test_match_dialogue_picks_best():
 
 
 def test_empty_dialogue_errors():
-    result = match_dialogue("", EPISODES, path=Path("x.mkv"))
+    result = match_dialogue("", EPISODES, path=Path("x.mkv"), sample_quality=80)
     assert result.error
+
+
+def test_poor_ocr_refuses_match():
+    result = match_dialogue(
+        "me hoya se pre xyz abc",
+        EPISODES,
+        path=Path("x.mkv"),
+        sample_quality=10,
+    )
+    assert result.error
+    assert result.season is None
 
 
 def test_demote_duplicates():

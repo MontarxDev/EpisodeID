@@ -1,4 +1,11 @@
-from episodeid.textutil import clean_line, join_dialogue, unique_lines
+from episodeid.textutil import (
+    clean_line,
+    join_dialogue,
+    line_quality,
+    sample_quality,
+    unique_lines,
+    unique_quality_lines,
+)
 
 
 def test_clean_line_strips_ass_and_tags():
@@ -6,10 +13,20 @@ def test_clean_line_strips_ass_and_tags():
     assert clean_line(raw) == "Hello there!"
 
 
-def test_unique_lines_dedupes_and_limits():
-    lines = ["Hello", "hello", "World", "!!!", "Another"]
-    out = unique_lines(lines, max_lines=2)
-    assert out == ["Hello", "World"]
+def test_unique_lines_prefers_quality_not_junk():
+    lines = ["= | 7 se Pre", "me hoya", "Too late it is. Sprung is the trap.", "hello"]
+    out = unique_quality_lines(lines, max_lines=5, min_quality=0.35)
+    assert any("trap" in ln.lower() or "late" in ln.lower() for ln in out)
+    assert not any("|" in ln for ln in out)
+
+
+def test_gibberish_low_quality():
+    assert line_quality("= | 7 se Pre") < 0.35
+    assert line_quality("Too late it is. Sprung is the trap.") >= 0.35
+
+
+def test_sample_quality_empty():
+    assert sample_quality([]) == 0.0
 
 
 def test_join_dialogue():

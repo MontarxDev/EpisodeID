@@ -128,6 +128,18 @@ def line_best_scores(lines: list[str], episode: Episode) -> float:
     return sum(top) / len(top)
 
 
+def _short_corpus(episode: Episode, max_words: int = 55) -> str:
+    """Title + truncated overview so long plots don't dominate fuzzy/IDF."""
+    title = (episode.title or "").strip()
+    overview = (episode.overview or "").strip()
+    words = overview.split()
+    if len(words) > max_words:
+        overview = " ".join(words[:max_words])
+    if overview:
+        return f"{title}. {overview}"
+    return title
+
+
 def score_dialogue_against_episode(
     dialogue: str,
     episode: Episode,
@@ -141,9 +153,16 @@ def score_dialogue_against_episode(
         return 0.0
 
     idf = idf or {}
-    overlap = idf_overlap_score(dialogue, episode, idf) if idf else 0.0
+    # Temporarily score IDF against truncated corpus via a shallow copy-like Episode
+    short_ep = Episode(
+        season=episode.season,
+        episode=episode.episode,
+        title=episode.title,
+        overview=" ".join((episode.overview or "").split()[:55]),
+    )
+    overlap = idf_overlap_score(dialogue, short_ep, idf) if idf else 0.0
 
-    corpus = episode.match_corpus.strip()
+    corpus = _short_corpus(episode)
     title = (episode.title or "").strip()
     fuzzy = 0.0
     if corpus:
@@ -155,21 +174,25 @@ def score_dialogue_against_episode(
         fuzzy = max(fuzzy, float(fuzz.token_set_ratio(dialogue, title)) * 0.9)
 
     if lines:
-        line_score = line_best_scores(lines, episode)
+        line_score = line_best_scores(lines, short_ep)
     else:
         pseudo = [p.strip() for p in re.split(r"[.!?]\s+|\n", dialogue) if len(p.strip()) > 8]
-        line_score = line_best_scores(pseudo, episode) if pseudo else 0.0
+        line_score = line_best_scores(pseudo, short_ep) if pseudo else 0.0
 
-    # Do not allow pure fuzzy to dominate — plots rarely share wording with dialogue.
-    # IDF overlap is the primary signal; fuzzy is a weak support term.
-    score = 0.62 * overlap + 0.18 * fuzzy + 0.20 * line_score
+    # IDF overlap is primary; fuzzy is support. Cap fuzzy contribution.
+    score = 0.58 * overlap + 0.17 * min(fuzzy, 75.0) + 0.18 * line_score
 
     # Strong bonus when high-IDF tokens match (character/place names)
     d_set = set(significant_tokens(dialogue))
     e_set = set(significant_tokens(corpus + " " + title))
     strong_hits = [t for t in d_set & e_set if idf.get(t, 0) >= 1.9]
     if strong_hits:
-        score += min(25.0, 6.0 * len(strong_hits) + sum(idf.get(t, 0) for t in strong_hits[:5]))
+        score += min(22.0, 5.5 * len(strong_hits) + sum(idf.get(t, 0) for t in strong_hits[:5]))
+
+    # Extra boost for title word hits in dialogue (Ambush rarely helps, but "Rookies" etc. do)
+    title_toks = set(significant_tokens(title))
+    if title_toks and title_toks & d_set:
+        score += 8.0 * (len(title_toks & d_set) / len(title_toks))
 
     return max(0.0, min(100.0, score))
 
@@ -184,26 +207,55 @@ def match_dialogue(
     auto_threshold: float = 70.0,
     top_n: int = 3,
     lines: list[str] | None = None,
+    sample_quality: float = 100.0,
+    track_info: str | None = None,
+    min_sample_quality: float = 35.0,
 ) -> MatchResult:
     path = path or Path(".")
+    if lines is None:
+        lines = [ln.strip() for ln in re.split(r"[\n\r]+|(?<=[.!?])\s+", dialogue or "") if ln.strip()]
+
+    base_meta = dict(
+        dialogue_source=dialogue_source,
+        dialogue_lines=list(lines or [])[:20],
+        sample_quality=sample_quality,
+        track_info=track_info,
+    )
+
+    if sample_quality < min_sample_quality:
+        return MatchResult(
+            path=path,
+            error=f"Dialogue sample quality too low ({sample_quality:.0f}%) — refusing match",
+            low_confidence=True,
+            flags=["poor_ocr", "no_match"],
+            **base_meta,
+        )
     if not dialogue or not dialogue.strip():
         return MatchResult(
             path=path,
             error="No dialogue sample available",
-            dialogue_source=dialogue_source,
             low_confidence=True,
+            **base_meta,
         )
     if not episodes:
         return MatchResult(
             path=path,
             error="No episode metadata available",
-            dialogue_source=dialogue_source,
             low_confidence=True,
+            **base_meta,
+        )
+
+    # Need enough distinctive tokens
+    if len(set(significant_tokens(dialogue))) < 3:
+        return MatchResult(
+            path=path,
+            error="Not enough distinctive dialogue tokens to match",
+            low_confidence=True,
+            flags=["short_sample", "no_match"],
+            **base_meta,
         )
 
     idf = build_idf(episodes)
-    if lines is None:
-        lines = [ln.strip() for ln in re.split(r"[\n\r]+|(?<=[.!?])\s+", dialogue) if ln.strip()]
 
     scored: list[tuple[float, Episode]] = []
     for ep in episodes:
@@ -221,15 +273,27 @@ def match_dialogue(
         if margin > 5:
             best_score = min(100.0, best_score + min(margin * 0.4, 15))
 
+    # Scale confidence by sample quality so OCR junk cannot claim 80%+
+    quality_factor = max(0.15, min(1.0, sample_quality / 100.0))
+    best_score = best_score * (0.35 + 0.65 * quality_factor)
+
     candidates = [
         CandidateMatch(
             season=ep.season,
             episode=ep.episode,
             title=ep.title,
-            confidence=round(score, 1),
+            confidence=round(score * (0.35 + 0.65 * quality_factor), 1),
         )
         for score, ep in scored[:top_n]
     ]
+
+    flags: list[str] = []
+    if best_score >= auto_threshold:
+        pass
+    elif best_score >= low_threshold:
+        flags.append("review")
+    else:
+        flags.append("low_confidence")
 
     return MatchResult(
         path=path,
@@ -239,10 +303,8 @@ def match_dialogue(
         confidence=round(best_score, 1),
         low_confidence=best_score < low_threshold,
         candidates=candidates,
-        dialogue_source=dialogue_source,
-        flags=[]
-        if best_score >= auto_threshold
-        else (["review"] if best_score >= low_threshold else ["low_confidence"]),
+        flags=flags,
+        **base_meta,
     )
 
 
@@ -252,6 +314,27 @@ def match_sample(
     **kwargs,
 ) -> MatchResult:
     return match_dialogue(join_dialogue(lines), episodes, lines=lines, **kwargs)
+
+
+def score_all_episodes(
+    dialogue: str,
+    episodes: list[Episode],
+    *,
+    lines: list[str] | None = None,
+    sample_quality: float = 100.0,
+) -> list[float]:
+    """Return raw hybrid scores for each episode (quality-scaled)."""
+    if not dialogue or not episodes:
+        return [0.0] * len(episodes)
+    idf = build_idf(episodes)
+    if lines is None:
+        lines = [ln.strip() for ln in re.split(r"[\n\r]+|(?<=[.!?])\s+", dialogue) if ln.strip()]
+    quality_factor = max(0.15, min(1.0, sample_quality / 100.0))
+    scores = []
+    for ep in episodes:
+        sc = score_dialogue_against_episode(dialogue, ep, idf=idf, lines=lines)
+        scores.append(sc * (0.35 + 0.65 * quality_factor))
+    return scores
 
 
 def demote_duplicate_claims(results: list[MatchResult]) -> list[MatchResult]:
@@ -275,3 +358,81 @@ def demote_duplicate_claims(results: list[MatchResult]) -> list[MatchResult]:
                 result.flags.append("duplicate_claim")
             result.low_confidence = True
     return results
+
+
+def reassign_unique_episodes(
+    results: list[MatchResult],
+    episodes: list[Episode],
+    *,
+    score_matrix: list[list[float]] | None = None,
+    low_threshold: float = 55.0,
+    auto_threshold: float = 70.0,
+) -> list[MatchResult]:
+    """Greedy unique file→episode assignment maximizing scores.
+
+    ``score_matrix[i][j]`` is score of results[i] vs episodes[j].
+    When provided, rewrites season/episode/title/confidence for non-error rows.
+    """
+    if not results or not episodes or not score_matrix:
+        return demote_duplicate_claims(results)
+
+    # Build candidate pairs (score, file_idx, ep_idx)
+    pairs: list[tuple[float, int, int]] = []
+    for i, row_scores in enumerate(score_matrix):
+        if results[i].error and "poor_ocr" in (results[i].flags or []):
+            continue
+        if results[i].sample_quality and results[i].sample_quality < 30:
+            continue
+        for j, sc in enumerate(row_scores):
+            if sc >= max(25.0, low_threshold * 0.4):
+                pairs.append((sc, i, j))
+    pairs.sort(reverse=True, key=lambda x: x[0])
+
+    used_files: set[int] = set()
+    used_eps: set[int] = set()
+    assignment: dict[int, tuple[int, float]] = {}
+    for sc, i, j in pairs:
+        if i in used_files or j in used_eps:
+            continue
+        used_files.add(i)
+        used_eps.add(j)
+        assignment[i] = (j, sc)
+
+    for i, result in enumerate(results):
+        if i not in assignment:
+            continue
+        j, sc = assignment[i]
+        ep = episodes[j]
+        result.season = ep.season
+        result.episode = ep.episode
+        result.title = ep.title
+        result.confidence = round(sc, 1)
+        result.low_confidence = sc < low_threshold
+        result.error = None
+        flags = [f for f in result.flags if f not in {"duplicate_claim", "low_confidence", "review", "no_match"}]
+        if sc >= auto_threshold:
+            pass
+        elif sc >= low_threshold:
+            flags.append("review")
+        else:
+            flags.append("low_confidence")
+        if "assigned_unique" not in flags:
+            flags.append("assigned_unique")
+        result.flags = flags
+        # Refresh top candidates from this row's scores
+        ranked = sorted(
+            ((score_matrix[i][k], episodes[k]) for k in range(len(episodes))),
+            key=lambda x: x[0],
+            reverse=True,
+        )[:3]
+        result.candidates = [
+            CandidateMatch(
+                season=ep.season,
+                episode=ep.episode,
+                title=ep.title,
+                confidence=round(sc, 1),
+            )
+            for sc, ep in ranked
+        ]
+
+    return demote_duplicate_claims(results)

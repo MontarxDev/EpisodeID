@@ -59,7 +59,7 @@ class Settings:
     size_filter_enabled: bool = True
     size_filter_ratio: float = 0.25
     skip_already_named: bool = False
-    theme: str = "system"  # system | light | dark
+    theme: str = "light"  # light | dark | system — light default for readable tables
     llm_enabled: bool = False
     llm_provider: str = "ollama"  # ollama | gemini | openai | grok
     llm_model: str = ""
@@ -68,6 +68,8 @@ class Settings:
     last_folder: str = ""
     last_series_id: int | None = None
     last_series_name: str = ""
+    # None or 0 = all seasons; otherwise only match episodes in this season
+    season_filter: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

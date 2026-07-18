@@ -91,6 +91,9 @@ def build_plan_row(
         flags=list(result.flags),
         candidates=list(result.candidates),
         target_dir=path.parent,
+        dialogue_lines=list(result.dialogue_lines or []),
+        sample_quality=result.sample_quality,
+        track_info=result.track_info,
     )
 
     if result.error or result.season is None or result.episode is None:

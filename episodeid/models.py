@@ -46,6 +46,9 @@ class DialogueSample:
     source: str = "none"  # external_srt | embedded_text | ocr_pgs | ocr_vobsub | ocr_overlay | none
     raw_text: str = ""
     track_info: str = ""
+    quality: float = 0.0  # 0–100 OCR/text sample quality
+    duration_sec: float = 0.0
+    error: str | None = None
 
     def is_empty(self) -> bool:
         return not (self.raw_text or self.lines)
@@ -71,6 +74,9 @@ class MatchResult:
     error: str | None = None
     dialogue_source: str | None = None
     flags: list[str] = field(default_factory=list)
+    dialogue_lines: list[str] = field(default_factory=list)
+    sample_quality: float = 0.0
+    track_info: str | None = None
 
     @property
     def code(self) -> str | None:
@@ -95,6 +101,9 @@ class RenamePlanRow:
     dialogue_source: str | None = None
     flags: list[str] = field(default_factory=list)
     candidates: list[CandidateMatch] = field(default_factory=list)
+    dialogue_lines: list[str] = field(default_factory=list)
+    sample_quality: float = 0.0
+    track_info: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -111,6 +120,9 @@ class RenamePlanRow:
             "error": self.error,
             "dialogue_source": self.dialogue_source,
             "flags": list(self.flags),
+            "dialogue_lines": list(self.dialogue_lines[:20]),
+            "sample_quality": self.sample_quality,
+            "track_info": self.track_info,
         }
 
 

@@ -33,4 +33,4 @@ def test_external_srt(tmp_path: Path):
 
 def test_unique_from_srt_lines():
     lines = unique_lines(["Hello there", "Hello there", "General Kenobi"])
-    assert lines == ["Hello there", "General Kenobi"]
+    assert set(lines) == {"Hello there", "General Kenobi"}

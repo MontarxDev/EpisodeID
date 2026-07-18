@@ -39,7 +39,7 @@ from episodeid.config import (
 )
 from episodeid.deps import summary_text
 from episodeid.gui.settings_dialog import SettingsDialog
-from episodeid.gui.styles import stylesheet_for
+from episodeid.gui.styles import confidence_colors, stylesheet_for
 from episodeid.gui.workers import ApplyWorker, IdentifyWorker
 from episodeid.metadata import TMDBClient, TMDBError
 from episodeid.models import ProgressEvent, RenamePlanRow, SeriesInfo
@@ -133,6 +133,19 @@ class MainWindow(QMainWindow):
         self.season_check = QCheckBox("Organize into Season XX folders")
         self.season_check.setChecked(self.settings.move_to_season)
         opt_row.addWidget(self.season_check)
+        opt_row.addWidget(QLabel("Match season:"))
+        self.season_filter = QComboBox()
+        self.season_filter.addItem("All seasons", 0)
+        for n in range(1, 31):
+            self.season_filter.addItem(f"Season {n:02d} only", n)
+        sf = getattr(self.settings, "season_filter", None) or 0
+        idx = self.season_filter.findData(int(sf))
+        self.season_filter.setCurrentIndex(max(0, idx))
+        self.season_filter.setToolTip(
+            "Limit matching to one season (recommended for DVD disc folders). "
+            "Improves free TMDB/plot matching a lot."
+        )
+        opt_row.addWidget(self.season_filter)
         opt_row.addWidget(QLabel("Format:"))
         self.format_edit = QLineEdit(self.settings.rename_format or DEFAULT_FORMAT)
         opt_row.addWidget(self.format_edit, stretch=1)
@@ -189,17 +202,18 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if not app:
             return
-        hints = app.styleHints()
         system_dark = False
         try:
-            # Qt 6.5+
             from PySide6.QtCore import Qt as _Qt
 
-            scheme = hints.colorScheme()
+            scheme = app.styleHints().colorScheme()
             system_dark = scheme == _Qt.ColorScheme.Dark
         except Exception:
             system_dark = False
-        app.setStyleSheet(stylesheet_for(self.settings.theme, system_dark=system_dark))
+        self._system_dark = system_dark
+        # Default "system" unknown on Mint often → light for readable tables
+        theme = self.settings.theme or "light"
+        app.setStyleSheet(stylesheet_for(theme, system_dark=system_dark))
 
     def open_settings(self) -> None:
         dlg = SettingsDialog(self.settings, self)
@@ -291,6 +305,10 @@ class MainWindow(QMainWindow):
         self.settings.move_to_season = self.season_check.isChecked()
         self.settings.rename_format = self.format_edit.text().strip() or DEFAULT_FORMAT
         self.settings.last_folder = str(folder)
+        sf_data = self.season_filter.currentData()
+        self.settings.season_filter = int(sf_data) if sf_data else None
+        if self.settings.season_filter == 0:
+            self.settings.season_filter = None
         save_settings(self.settings)
 
         if not self.episodes:
@@ -387,6 +405,9 @@ class MainWindow(QMainWindow):
             tip_parts = []
             if row.dialogue_source:
                 tip_parts.append(f"Source: {row.dialogue_source}")
+            if row.track_info:
+                tip_parts.append(f"Track: {row.track_info}")
+            tip_parts.append(f"Sample quality: {row.sample_quality:.0f}%")
             if row.flags:
                 tip_parts.append("Flags: " + ", ".join(row.flags))
             if row.error:
@@ -397,6 +418,9 @@ class MainWindow(QMainWindow):
                     for c in row.candidates[:3]
                 )
                 tip_parts.append("Top: " + alts)
+            if row.dialogue_lines:
+                tip_parts.append("Dialogue sample:")
+                tip_parts.extend(f"  • {ln}" for ln in row.dialogue_lines[:8])
             tip = "\n".join(tip_parts)
             for col in range(7):
                 item = self.table.item(row_idx, col)
@@ -407,18 +431,24 @@ class MainWindow(QMainWindow):
         self.table.blockSignals(False)
 
     def _color_row(self, row_idx: int, row: RenamePlanRow) -> None:
+        theme = self.settings.theme or "light"
+        system_dark = getattr(self, "_system_dark", False)
+        bands = confidence_colors(theme, system_dark=system_dark)
         if row.error:
-            color = QColor(255, 200, 200)
+            bg_hex, fg_hex = bands["error"]
         elif row.confidence >= 70:
-            color = QColor(200, 240, 200)
+            bg_hex, fg_hex = bands["high"]
         elif row.confidence >= self.settings.low_threshold:
-            color = QColor(255, 245, 180)
+            bg_hex, fg_hex = bands["mid"]
         else:
-            color = QColor(255, 210, 210)
+            bg_hex, fg_hex = bands["low"]
+        bg = QColor(bg_hex)
+        fg = QColor(fg_hex)
         for col in range(7):
             item = self.table.item(row_idx, col)
             if item:
-                item.setBackground(color)
+                item.setBackground(bg)
+                item.setForeground(fg)
 
     def _on_item_changed(self, item: QTableWidgetItem) -> None:
         row_idx = item.row()
