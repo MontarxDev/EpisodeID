@@ -14,7 +14,8 @@ OPTIONAL_TOOLS = {
     "tesseract": "tesseract-ocr",
 }
 
-APT_PACKAGES = ("ffmpeg", "mkvtoolnix", "tesseract-ocr")
+# libxcb-cursor0 is required by Qt 6.5+ xcb platform (source installs / non-bundled runs)
+APT_PACKAGES = ("ffmpeg", "mkvtoolnix", "tesseract-ocr", "libxcb-cursor0")
 
 
 @dataclass

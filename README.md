@@ -42,10 +42,13 @@ Primary target: **Linux Mint / Ubuntu / Debian**. License: **MIT**.
 ### System packages
 
 ```bash
-sudo apt install ffmpeg mkvtoolnix tesseract-ocr
+sudo apt install ffmpeg mkvtoolnix tesseract-ocr libxcb-cursor0
 # Optional build helpers:
 # sudo apt install python3-venv python3-pip
 ```
+
+`libxcb-cursor0` is required for the Qt GUI on X11 (Ubuntu/Mint). The AppImage
+bundles this library; source installs need the system package.
 
 ### Python app
 
