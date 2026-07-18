@@ -592,13 +592,80 @@ def sample_dialogue(
             shutil.rmtree(work, ignore_errors=True)
 
 
-def list_video_files(folder: Path) -> list[Path]:
+_SKIP_DIR_NAMES = {
+    ".git", ".svn", ".hg", ".trash", "trash", "@eadir", "#recycle",
+    "system volume information", "$recycle.bin", "__pycache__",
+}
+_SAMPLE_DIR_NAMES = {"sample", "samples", "preview", "previews"}
+
+
+def list_video_files(
+    folder: Path,
+    *,
+    recursive: bool = True,
+    skip_sample_folders: bool = True,
+    max_files: int = 2000,
+) -> list[Path]:
+    """Find video files in folder; optionally recurse into subfolders."""
     folder = Path(folder)
-    files = [
-        p for p in folder.iterdir()
-        if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS
-    ]
-    return sorted(files, key=lambda p: p.name.lower())
+    if not folder.is_dir():
+        return []
+
+    files: list[Path] = []
+    if not recursive:
+        for p in folder.iterdir():
+            if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS:
+                files.append(p)
+        return sorted(files, key=lambda p: str(p).lower())
+
+    for path in folder.rglob("*"):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in VIDEO_EXTENSIONS:
+            continue
+        # Skip hidden / junk path components
+        skip = False
+        for part in path.relative_to(folder).parts[:-1]:
+            low = part.lower()
+            if part.startswith(".") or low in _SKIP_DIR_NAMES:
+                skip = True
+                break
+            if skip_sample_folders and low in _SAMPLE_DIR_NAMES:
+                skip = True
+                break
+        if skip:
+            continue
+        files.append(path)
+        if len(files) >= max_files:
+            break
+    return sorted(files, key=lambda p: str(p).lower())
+
+
+def season_hint_from_path(path: Path) -> int | None:
+    """If path contains Season 01 / S01 folder, return season number."""
+    import re
+
+    for part in path.parts:
+        m = re.search(r"(?i)season[\s._-]*(\d{1,2})", part)
+        if m:
+            return int(m.group(1))
+        m = re.fullmatch(r"[Ss](\d{1,2})", part)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def detect_multipart(name: str) -> int | None:
+    """Return part number if filename looks like multi-part of one episode."""
+    import re
+
+    m = re.search(r"(?i)(?:^|[^a-z])(?:part|cd|disc|disk)[\s._-]*(\d{1,2})(?:[^0-9]|$)", name)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"(?i)[Ss]\d{1,2}[Ee]\d{1,2}[\s._-]*[Pp](?:art)?(\d{1,2})", name)
+    if m:
+        return int(m.group(1))
+    return None
 
 
 def filter_by_size(

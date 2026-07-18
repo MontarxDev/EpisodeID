@@ -133,6 +133,10 @@ class MainWindow(QMainWindow):
         self.season_check = QCheckBox("Organize into Season XX folders")
         self.season_check.setChecked(self.settings.move_to_season)
         opt_row.addWidget(self.season_check)
+        self.recursive_check = QCheckBox("Include subfolders")
+        self.recursive_check.setChecked(getattr(self.settings, "recursive_scan", True))
+        self.recursive_check.setToolTip("Scan all nested folders for video files")
+        opt_row.addWidget(self.recursive_check)
         opt_row.addWidget(QLabel("Match season:"))
         self.season_filter = QComboBox()
         self.season_filter.addItem("All seasons", 0)
@@ -143,7 +147,7 @@ class MainWindow(QMainWindow):
         self.season_filter.setCurrentIndex(max(0, idx))
         self.season_filter.setToolTip(
             "Limit matching to one season (recommended for DVD disc folders). "
-            "Improves free TMDB/plot matching a lot."
+            "Also limits which reference subtitles are fetched/cached."
         )
         opt_row.addWidget(self.season_filter)
         opt_row.addWidget(QLabel("Format:"))
@@ -191,6 +195,12 @@ class MainWindow(QMainWindow):
         self.undo_btn = QPushButton("Undo last apply")
         self.undo_btn.clicked.connect(self.undo_apply)
         foot.addWidget(self.undo_btn)
+        self.retry_btn = QPushButton("Retry problem rows")
+        self.retry_btn.setToolTip(
+            "Re-extract and re-match only failed / low-confidence / duplicate rows"
+        )
+        self.retry_btn.clicked.connect(self.retry_problems)
+        foot.addWidget(self.retry_btn)
         foot.addStretch()
         self.apply_btn = QPushButton("Apply Selected Renames")
         self.apply_btn.setObjectName("primary")
@@ -303,6 +313,7 @@ class MainWindow(QMainWindow):
             return
 
         self.settings.move_to_season = self.season_check.isChecked()
+        self.settings.recursive_scan = self.recursive_check.isChecked()
         self.settings.rename_format = self.format_edit.text().strip() or DEFAULT_FORMAT
         self.settings.last_folder = str(folder)
         sf_data = self.season_filter.currentData()
@@ -598,3 +609,37 @@ class MainWindow(QMainWindow):
         if err:
             msg += "\n" + "\n".join(e.get("error", str(e)) for e in err[:8])
         QMessageBox.information(self, "Undo", msg)
+
+    def retry_problems(self) -> None:
+        if not self.plan or not self.series:
+            QMessageBox.information(self, "Retry", "Run a scan first.")
+            return
+        if not self.episodes:
+            key = get_tmdb_api_key()
+            if not key:
+                return
+            try:
+                self.episodes = TMDBClient(key).get_all_episodes(self.series.id)
+            except TMDBError as exc:
+                QMessageBox.critical(self, "TMDB", str(exc))
+                return
+        from episodeid.pipeline import retry_problem_rows
+
+        folder = Path(self.folder_edit.text().strip())
+        self.retry_btn.setEnabled(False)
+        self.progress_label.setText("Retrying problem rows…")
+        try:
+            self.plan = retry_problem_rows(
+                self.plan,
+                folder=folder,
+                series=self.series,
+                episodes=self.episodes,
+                settings=self.settings,
+                progress=lambda ev: self.progress_label.setText(ev.message),
+            )
+            self._fill_table()
+            self.progress_label.setText("Retry complete — review table")
+        except Exception as exc:
+            QMessageBox.critical(self, "Retry failed", str(exc))
+        finally:
+            self.retry_btn.setEnabled(True)

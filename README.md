@@ -129,12 +129,16 @@ Free path (layered for accuracy):
 | **Reference SRT match** | Settings → Accuracy → Wyzie free key (best free accuracy) |
 | Optional LLM | Settings → Gemini / Ollama if still stuck |
 
-**Tips for disc rips (Clone Wars S1D1 etc.):**
+**Tips for disc rips & big libraries:**
 
-- Settings → Accuracy: enable TVMaze + reference subs; paste free Wyzie key  
-- Use **Match season: Season 01 only** then scan once (caches that season’s SRTs)  
+- **Include subfolders** (default on) finds videos in nested Season / disc folders  
+- Settings → Accuracy: TVMaze + reference subs; free Wyzie key; policy **Use cache, download missing**  
+- Settings → **Cache**: durable path (survives reboot), stats, clear TMDB / TVMaze / ref subs  
+- **Match season: Season 01 only** then first scan caches that season’s SRTs (later scans = cache hits only)  
+- **Retry problem rows** re-does only dupes / low-confidence / failed rows  
 - Hover a row for dialogue sample + OCR quality  
-- Scan logs: `~/.local/share/episodeid/scans/`
+- Scan logs: `~/.local/share/episodeid/scans/`  
+- Durable cache default: `~/.local/share/episodeid/cache/`
 
 Confidence bands (defaults):
 

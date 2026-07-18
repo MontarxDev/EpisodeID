@@ -1,7 +1,7 @@
 """Reference subtitle download + sampling for high-accuracy free matching.
 
 Primary provider: Wyzie Subs (free API key from https://store.wyzie.io/redeem).
-Results are cached under ~/.cache/episodeid/refsubs/.
+Results are cached under the durable/app cache root (survives reboot).
 """
 
 from __future__ import annotations
@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import re
 import zipfile
+from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable
@@ -32,16 +33,13 @@ def _episode_cache_path(tmdb_id: int, season: int, episode: int) -> Path:
 
 def _sample_from_srt_bytes(data: bytes, max_lines: int = 80) -> list[str]:
     text = data.decode("utf-8", errors="replace")
-    # strip BOM
     if text.startswith("\ufeff"):
         text = text[1:]
-    # crude SRT parse
     lines: list[str] = []
     for block in re.split(r"\n\s*\n", text):
         parts = [p for p in block.strip().splitlines() if p.strip()]
         if not parts:
             continue
-        # drop index + timestamp
         body = []
         for p in parts:
             if re.match(r"^\d+$", p.strip()):
@@ -62,15 +60,12 @@ def _extract_srt_from_download(content: bytes, content_type: str = "") -> bytes 
                 names = [n for n in zf.namelist() if n.lower().endswith((".srt", ".vtt", ".ass"))]
                 if not names:
                     return None
-                # prefer .srt
                 names.sort(key=lambda n: (0 if n.lower().endswith(".srt") else 1, n))
                 return zf.read(names[0])
         except zipfile.BadZipFile:
             return None
-    # plain text srt
-    if b"-->" in content[:4000] or content_type.startswith("text"):
+    if b"-->" in content[:4000] or ctype.startswith("text"):
         return content
-    # try as text anyway
     try:
         content.decode("utf-8")
         return content
@@ -115,7 +110,7 @@ def search_wyzie(
 def _pick_best_result(results: list[dict[str, Any]]) -> dict[str, Any] | None:
     if not results:
         return None
-    # Prefer English, srt, high downloads if present
+
     def score(item: dict[str, Any]) -> tuple:
         lang = str(item.get("language") or item.get("lang") or "").lower()
         fmt = str(item.get("format") or item.get("encoding") or item.get("url") or "").lower()
@@ -134,6 +129,16 @@ def download_url(url: str, session: requests.Session | None = None) -> tuple[byt
     return resp.content, resp.headers.get("Content-Type", "")
 
 
+def load_cached_sample(tmdb_id: int, season: int, episode: int) -> str:
+    cache_path = _episode_cache_path(tmdb_id, season, episode)
+    if not cache_path.exists():
+        return ""
+    try:
+        return json.loads(cache_path.read_text(encoding="utf-8")).get("sample") or ""
+    except (OSError, json.JSONDecodeError):
+        return ""
+
+
 def get_reference_dialogue_sample(
     tmdb_id: int,
     season: int,
@@ -143,61 +148,75 @@ def get_reference_dialogue_sample(
     max_lines: int = 80,
     session: requests.Session | None = None,
     force_refresh: bool = False,
-) -> str:
-    """Return cached or freshly downloaded reference dialogue sample text."""
-    cache_path = _episode_cache_path(tmdb_id, season, episode)
-    if cache_path.exists() and not force_refresh:
-        try:
-            data = json.loads(cache_path.read_text(encoding="utf-8"))
-            sample = data.get("sample") or ""
-            if sample:
-                return sample
-        except (OSError, json.JSONDecodeError):
-            pass
+    allow_download: bool = True,
+    save_to_cache: bool = True,
+) -> tuple[str, str]:
+    """Return (sample_text, source) where source is cache|download|none."""
+    if not force_refresh:
+        cached = load_cached_sample(tmdb_id, season, episode)
+        if cached:
+            return cached, "cache"
 
-    if not api_key:
-        return ""
+    if not allow_download or not api_key:
+        return "", "none"
 
     session = session or requests.Session()
     try:
         results = search_wyzie(tmdb_id, season, episode, api_key=api_key, session=session)
     except Exception:
-        return ""
+        return "", "none"
 
     best = _pick_best_result(results)
     if not best:
-        return ""
+        return "", "none"
 
     url = best.get("url") or best.get("download") or best.get("link") or best.get("file")
     if not url:
-        return ""
+        return "", "none"
 
     try:
         content, ctype = download_url(str(url), session=session)
         srt = _extract_srt_from_download(content, ctype)
         if not srt:
-            return ""
+            return "", "none"
         lines = _sample_from_srt_bytes(srt, max_lines=max_lines)
         sample = join_dialogue(lines)
     except Exception:
-        return ""
+        return "", "none"
 
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    cache_path.write_text(
-        json.dumps(
-            {
-                "tmdb_id": tmdb_id,
-                "season": season,
-                "episode": episode,
-                "source_url": str(url),
-                "sample": sample,
-                "line_count": len(lines),
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-    return sample
+    if save_to_cache and sample:
+        cache_path = _episode_cache_path(tmdb_id, season, episode)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(
+            json.dumps(
+                {
+                    "tmdb_id": tmdb_id,
+                    "season": season,
+                    "episode": episode,
+                    "source_url": str(url),
+                    "sample": sample,
+                    "line_count": len(lines),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    return sample, "download"
+
+
+@dataclass
+class RefAttachStats:
+    cached: int = 0
+    downloaded: int = 0
+    failed: int = 0
+    attached: int = 0
+    policy: str = "download-missing"
+
+    def summary(self) -> str:
+        return (
+            f"Reference: {self.cached} cached · {self.downloaded} downloaded · "
+            f"{self.failed} failed · policy={self.policy}"
+        )
 
 
 def attach_reference_subs(
@@ -208,39 +227,43 @@ def attach_reference_subs(
     max_episodes: int = 40,
     progress: Callable[[str], None] | None = None,
     session: requests.Session | None = None,
-) -> int:
-    """Download/cache reference dialogue for episodes. Returns count with ref text."""
-    if not api_key:
-        # Still load any already-cached samples
-        attached = 0
-        for ep in episodes:
-            sample = ""
-            cache_path = _episode_cache_path(tmdb_id, ep.season, ep.episode)
-            if cache_path.exists():
-                try:
-                    sample = json.loads(cache_path.read_text(encoding="utf-8")).get("sample") or ""
-                except (OSError, json.JSONDecodeError):
-                    sample = ""
-            if sample:
-                ep.ref_dialogue = sample
-                attached += 1
-        return attached
-
-    session = session or requests.Session()
+    policy: str = "download-missing",
+    save_to_cache: bool = True,
+) -> RefAttachStats:
+    """Attach reference dialogue. policy: download-missing | cache-only | force-refresh."""
+    stats = RefAttachStats(policy=policy)
     progress = progress or (lambda _m: None)
-    attached = 0
-    # Prefer limiting when many episodes: process season-filtered list (caller should filter)
+    session = session or requests.Session()
+    force = policy == "force-refresh"
+    allow_download = policy in {"download-missing", "force-refresh"} and bool(api_key)
+
     targets = episodes[:max_episodes]
     for i, ep in enumerate(targets, start=1):
         progress(f"Reference subtitles {i}/{len(targets)}: {ep.code}")
-        sample = get_reference_dialogue_sample(
+        sample, source = get_reference_dialogue_sample(
             tmdb_id,
             ep.season,
             ep.episode,
             api_key=api_key,
             session=session,
+            force_refresh=force,
+            allow_download=allow_download,
+            save_to_cache=save_to_cache,
         )
         if sample:
             ep.ref_dialogue = sample
-            attached += 1
-    return attached
+            stats.attached += 1
+            if source == "cache":
+                stats.cached += 1
+            elif source == "download":
+                stats.downloaded += 1
+        else:
+            # try pure cache load when download failed
+            cached = load_cached_sample(tmdb_id, ep.season, ep.episode)
+            if cached and not force:
+                ep.ref_dialogue = cached
+                stats.attached += 1
+                stats.cached += 1
+            else:
+                stats.failed += 1
+    return stats

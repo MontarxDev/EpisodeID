@@ -20,10 +20,6 @@ def config_dir() -> Path:
     return Path.home() / ".config" / __app_id__
 
 
-def cache_dir() -> Path:
-    return Path.home() / ".cache" / __app_id__
-
-
 def data_dir() -> Path:
     return Path.home() / ".local" / "share" / __app_id__
 
@@ -34,6 +30,29 @@ def settings_path() -> Path:
 
 def undo_dir() -> Path:
     return data_dir() / "undo"
+
+
+def _load_durable_pref() -> bool:
+    """Read durable_cache without full Settings load (avoid cycles)."""
+    path = settings_path()
+    if not path.exists():
+        return True
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and "durable_cache" in data:
+            return bool(data["durable_cache"])
+    except (OSError, json.JSONDecodeError):
+        pass
+    return True
+
+
+def cache_dir() -> Path:
+    """Active cache root (durable share path by default — survives reboot and ~/.cache cleans)."""
+    from episodeid.cache_manager import cache_root, ensure_cache_layout
+
+    durable = _load_durable_pref()
+    ensure_cache_layout(durable)
+    return cache_root(durable)
 
 
 def tmdb_cache_dir() -> Path:
@@ -74,6 +93,16 @@ class Settings:
     # Free accuracy boosters
     use_tvmaze: bool = True
     use_reference_subs: bool = True  # needs free Wyzie key for downloads; uses cache if present
+    save_refsubs_to_cache: bool = True
+    # download-missing | cache-only | force-refresh
+    refsubs_network_policy: str = "download-missing"
+    # Library scan
+    recursive_scan: bool = True
+    skip_sample_folders: bool = True
+    auto_resolve_problems: bool = True
+    # Cache location: durable = ~/.local/share/episodeid/cache (recommended)
+    durable_cache: bool = True
+    rename_in_place: bool = False  # False = Season folders under scan root
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
