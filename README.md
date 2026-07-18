@@ -115,24 +115,26 @@ Season 01/Star Wars The Clone Wars - S01E01 - Ambush.mkv
 
 ## Matching strategy (no LLM required)
 
-EpisodeID does **not** compare your file to official subtitle downloads. Free path:
+Free path (layered for accuracy):
 
-1. Extract a dialogue sample from the MKV (text track or **OCR** of eng image subs)
-2. Load TMDB episode **titles + plots** (cached after first fetch)
-3. Score sample vs each plot (token overlap + RapidFuzz)
-4. Assign unique SxxExx across the folder; show confidence before rename
-
-**Tips for disc rips (Clone Wars S1D1 etc.):**
-
-- Use **Match season: Season 01 only** — hugely reduces wrong-season hits  
-- Hover a row to see the **extracted dialogue sample** and OCR quality  
-- Scan logs: `~/.local/share/episodeid/scans/`  
-- Mega “all episodes” titles and tiny extras are skipped by size filter  
+1. **Extract** dialogue from the MKV (text track or OCR of eng image subs)
+2. **TMDB** episode titles + plots (your free API key; cached)
+3. **TVMaze** free plot enrichment (no key) — merges extra summaries
+4. **Reference SRTs** (recommended) — optional free [Wyzie](https://store.wyzie.io/redeem) key downloads English subtitle samples; your dialogue is compared to real episode text (cached under `~/.cache/episodeid/refsubs/`)
+5. Score, unique-assign SxxExx across the folder, preview before rename
 
 | Mode | When |
 |------|------|
-| **TMDB + RapidFuzz** (default) | Dialogue sample vs episode title + plot |
-| **Optional LLM** | Settings → enable Gemini or Ollama; only short text is sent |
+| TMDB + TVMaze plots | Always available free (TMDB key for catalog) |
+| **Reference SRT match** | Settings → Accuracy → Wyzie free key (best free accuracy) |
+| Optional LLM | Settings → Gemini / Ollama if still stuck |
+
+**Tips for disc rips (Clone Wars S1D1 etc.):**
+
+- Settings → Accuracy: enable TVMaze + reference subs; paste free Wyzie key  
+- Use **Match season: Season 01 only** then scan once (caches that season’s SRTs)  
+- Hover a row for dialogue sample + OCR quality  
+- Scan logs: `~/.local/share/episodeid/scans/`
 
 Confidence bands (defaults):
 

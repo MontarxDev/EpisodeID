@@ -27,6 +27,7 @@ from episodeid.config import (
     KEY_GROK,
     KEY_OPENAI,
     KEY_TMDB,
+    KEY_WYZIE,
     Settings,
     get_secret,
     set_secret,
@@ -44,6 +45,7 @@ class SettingsDialog(QDialog):
 
         tabs = QTabWidget()
         tabs.addTab(self._tmdb_tab(), "TMDB")
+        tabs.addTab(self._accuracy_tab(), "Accuracy")
         tabs.addTab(self._matching_tab(), "Matching")
         tabs.addTab(self._rename_tab(), "Rename")
         tabs.addTab(self._llm_tab(), "Optional LLM")
@@ -77,6 +79,40 @@ class SettingsDialog(QDialog):
         row.addWidget(help_lbl)
         row.addStretch()
         form.addRow("", row)
+        return w
+
+    def _accuracy_tab(self) -> QWidget:
+        w = QWidget()
+        form = QFormLayout(w)
+        self.use_tvmaze = QCheckBox("Enrich plots with TVMaze (free, no key)")
+        self.use_tvmaze.setChecked(getattr(self.settings, "use_tvmaze", True))
+        self.use_refsubs = QCheckBox("Match against reference subtitles (recommended)")
+        self.use_refsubs.setChecked(getattr(self.settings, "use_reference_subs", True))
+        self.use_refsubs.setToolTip(
+            "Downloads English reference SRT samples via Wyzie (free key) and "
+            "compares your file's dialogue to real episode subtitles. "
+            "Uses local cache when available."
+        )
+        self.wyzie_key = QLineEdit(get_secret(KEY_WYZIE) or "")
+        self.wyzie_key.setEchoMode(QLineEdit.Password)
+        self.wyzie_key.setPlaceholderText("Free Wyzie API key (optional but recommended)")
+        help_lbl = QLabel(
+            'Get a free key: <a href="https://store.wyzie.io/redeem">store.wyzie.io/redeem</a><br>'
+            "With a key, EpisodeID compares OCR dialogue to real episode SRTs — "
+            "much more accurate than plots alone."
+        )
+        help_lbl.setOpenExternalLinks(True)
+        help_lbl.setWordWrap(True)
+        form.addRow(self.use_tvmaze)
+        form.addRow(self.use_refsubs)
+        form.addRow("Wyzie API key", self.wyzie_key)
+        form.addRow(help_lbl)
+        note = QLabel(
+            "Tip: set Match season to Season 01 only on disc rips, then scan once "
+            "to cache reference SRTs for that season."
+        )
+        note.setWordWrap(True)
+        form.addRow(note)
         return w
 
     def _matching_tab(self) -> QWidget:
@@ -226,7 +262,10 @@ class SettingsDialog(QDialog):
         set_secret(KEY_GEMINI, self.gemini_key.text().strip() or None)
         set_secret(KEY_OPENAI, self.openai_key.text().strip() or None)
         set_secret(KEY_GROK, self.grok_key.text().strip() or None)
+        set_secret(KEY_WYZIE, self.wyzie_key.text().strip() or None)
 
+        self.settings.use_tvmaze = self.use_tvmaze.isChecked()
+        self.settings.use_reference_subs = self.use_refsubs.isChecked()
         self.settings.low_threshold = float(self.low_threshold.value())
         self.settings.auto_threshold = float(self.auto_threshold.value())
         self.settings.offset_minutes = float(self.offset.value())

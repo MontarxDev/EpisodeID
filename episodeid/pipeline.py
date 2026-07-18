@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from episodeid.config import KEY_GEMINI, Settings, data_dir, get_secret
+from episodeid.config import KEY_GEMINI, KEY_WYZIE, Settings, data_dir, get_secret
 from episodeid.extractor import filter_by_size, list_video_files, sample_dialogue
 from episodeid.llm import identify_with_llm
 from episodeid.matcher import (
@@ -18,7 +18,9 @@ from episodeid.matcher import (
 )
 from episodeid.metadata import TMDBClient
 from episodeid.models import Episode, MatchResult, ProgressEvent, RenamePlanRow, SeriesInfo
+from episodeid.refsubs import attach_reference_subs
 from episodeid.renamer import build_plan
+from episodeid.tvmaze import enrich_episodes_with_tvmaze
 
 ProgressCb = Callable[[ProgressEvent], None]
 
@@ -82,6 +84,46 @@ def scan_and_identify(
         )
         if not episodes:
             raise ValueError(f"No episodes found for season {sf}")
+
+    # Free accuracy: TVMaze plot enrichment (no key)
+    if getattr(settings, "use_tvmaze", True):
+        progress(ProgressEvent("metadata", 0, 1, "Enriching episode plots via TVMaze (free)…"))
+        try:
+            episodes = enrich_episodes_with_tvmaze(episodes, series.name)
+        except Exception as exc:
+            progress(ProgressEvent("metadata", 0, 1, f"TVMaze skipped: {exc}"))
+
+    # High accuracy: reference SRTs (Wyzie free key optional; uses cache if present)
+    if getattr(settings, "use_reference_subs", True):
+        wyzie_key = get_secret(KEY_WYZIE)
+        progress(
+            ProgressEvent(
+                "metadata",
+                0,
+                1,
+                "Loading reference subtitles (Wyzie cache / free API key)…",
+            )
+        )
+        try:
+            # Limit downloads: season-filtered list preferred; else cap
+            max_eps = 40 if season_filter else 25
+            n_ref = attach_reference_subs(
+                episodes,
+                series.id,
+                api_key=wyzie_key,
+                max_episodes=max_eps,
+                progress=lambda m: progress(ProgressEvent("metadata", 0, 1, m)),
+            )
+            progress(
+                ProgressEvent(
+                    "metadata",
+                    0,
+                    1,
+                    f"Reference dialogue available for {n_ref}/{len(episodes)} episode(s)",
+                )
+            )
+        except Exception as exc:
+            progress(ProgressEvent("metadata", 0, 1, f"Reference subs skipped: {exc}"))
 
     progress(ProgressEvent("scan", 0, 1, f"Scanning {folder}"))
     files = list_video_files(folder)

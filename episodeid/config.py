@@ -45,6 +45,7 @@ KEY_TMDB = "tmdb_api_key"
 KEY_GEMINI = "gemini_api_key"
 KEY_OPENAI = "openai_api_key"
 KEY_GROK = "grok_api_key"
+KEY_WYZIE = "wyzie_api_key"
 
 
 @dataclass
@@ -70,6 +71,9 @@ class Settings:
     last_series_name: str = ""
     # None or 0 = all seasons; otherwise only match episodes in this season
     season_filter: int | None = None
+    # Free accuracy boosters
+    use_tvmaze: bool = True
+    use_reference_subs: bool = True  # needs free Wyzie key for downloads; uses cache if present
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

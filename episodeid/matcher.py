@@ -52,11 +52,12 @@ def significant_tokens(text: str) -> list[str]:
 
 
 def build_idf(episodes: list[Episode]) -> dict[str, float]:
-    """Inverse document frequency over episode title+overview tokens."""
+    """Inverse document frequency over episode title+overview (+ ref sample) tokens."""
     n = max(len(episodes), 1)
     df: Counter[str] = Counter()
     for ep in episodes:
-        df.update(set(significant_tokens(ep.match_corpus + " " + ep.title)))
+        blob = f"{ep.match_corpus} {ep.title} {ep.ref_dialogue[:800] if ep.ref_dialogue else ''}"
+        df.update(set(significant_tokens(blob)))
     return {tok: math.log((n + 1) / (freq + 1)) + 1.0 for tok, freq in df.items()}
 
 
@@ -128,16 +129,46 @@ def line_best_scores(lines: list[str], episode: Episode) -> float:
     return sum(top) / len(top)
 
 
-def _short_corpus(episode: Episode, max_words: int = 55) -> str:
-    """Title + truncated overview so long plots don't dominate fuzzy/IDF."""
+def _short_corpus(episode: Episode, max_words: int = 70) -> str:
+    """Title + truncated combined overviews so long plots don't dominate."""
     title = (episode.title or "").strip()
-    overview = (episode.overview or "").strip()
+    overview = f"{episode.overview or ''} {episode.extra_overview or ''}".strip()
     words = overview.split()
     if len(words) > max_words:
         overview = " ".join(words[:max_words])
     if overview:
         return f"{title}. {overview}"
     return title
+
+
+def _ref_dialogue_score(dialogue: str, ref: str, lines: list[str] | None = None) -> float:
+    """0–100 score comparing OCR/sample dialogue to reference SRT text."""
+    ref = (ref or "").strip()
+    dialogue = (dialogue or "").strip()
+    if not ref or not dialogue:
+        return 0.0
+    scores = [
+        float(fuzz.token_set_ratio(dialogue, ref[:4000])),
+        float(fuzz.partial_ratio(dialogue[:1500], ref[:4000])),
+        float(fuzz.token_sort_ratio(dialogue[:2000], ref[:2000])),
+    ]
+    if lines:
+        # Average of best line matches against reference (subtitle-to-subtitle)
+        line_scores = []
+        for line in lines[:25]:
+            if len(line) < 8:
+                continue
+            line_scores.append(
+                max(
+                    float(fuzz.partial_ratio(line, ref)),
+                    float(fuzz.token_set_ratio(line, ref[:2500])),
+                )
+            )
+        if line_scores:
+            line_scores.sort(reverse=True)
+            top = line_scores[: min(10, len(line_scores))]
+            scores.append(sum(top) / len(top))
+    return max(scores)
 
 
 def score_dialogue_against_episode(
@@ -153,12 +184,17 @@ def score_dialogue_against_episode(
         return 0.0
 
     idf = idf or {}
-    # Temporarily score IDF against truncated corpus via a shallow copy-like Episode
+    # Truncated plot corpus for IDF/fuzzy
+    short_overview = " ".join(
+        f"{episode.overview or ''} {episode.extra_overview or ''}".split()[:70]
+    )
     short_ep = Episode(
         season=episode.season,
         episode=episode.episode,
         title=episode.title,
-        overview=" ".join((episode.overview or "").split()[:55]),
+        overview=short_overview,
+        extra_overview="",
+        ref_dialogue=episode.ref_dialogue,
     )
     overlap = idf_overlap_score(dialogue, short_ep, idf) if idf else 0.0
 
@@ -179,20 +215,32 @@ def score_dialogue_against_episode(
         pseudo = [p.strip() for p in re.split(r"[.!?]\s+|\n", dialogue) if len(p.strip()) > 8]
         line_score = line_best_scores(pseudo, short_ep) if pseudo else 0.0
 
-    # IDF overlap is primary; fuzzy is support. Cap fuzzy contribution.
-    score = 0.58 * overlap + 0.17 * min(fuzzy, 75.0) + 0.18 * line_score
+    # Plot-based hybrid
+    plot_score = 0.55 * overlap + 0.18 * min(fuzzy, 75.0) + 0.18 * line_score
 
-    # Strong bonus when high-IDF tokens match (character/place names)
     d_set = set(significant_tokens(dialogue))
     e_set = set(significant_tokens(corpus + " " + title))
     strong_hits = [t for t in d_set & e_set if idf.get(t, 0) >= 1.9]
     if strong_hits:
-        score += min(22.0, 5.5 * len(strong_hits) + sum(idf.get(t, 0) for t in strong_hits[:5]))
+        plot_score += min(18.0, 5.0 * len(strong_hits) + sum(idf.get(t, 0) for t in strong_hits[:5]))
 
-    # Extra boost for title word hits in dialogue (Ambush rarely helps, but "Rookies" etc. do)
     title_toks = set(significant_tokens(title))
     if title_toks and title_toks & d_set:
-        score += 8.0 * (len(title_toks & d_set) / len(title_toks))
+        plot_score += 8.0 * (len(title_toks & d_set) / len(title_toks))
+
+    # Reference SRT path (high weight when available) — the accuracy jump
+    ref_score = 0.0
+    if episode.ref_dialogue:
+        ref_score = _ref_dialogue_score(dialogue, episode.ref_dialogue, lines=lines)
+        # Blend: reference dominates when strong
+        if ref_score >= 55:
+            score = 0.72 * ref_score + 0.28 * plot_score
+        elif ref_score >= 35:
+            score = 0.55 * ref_score + 0.45 * plot_score
+        else:
+            score = 0.30 * ref_score + 0.70 * plot_score
+    else:
+        score = plot_score
 
     return max(0.0, min(100.0, score))
 

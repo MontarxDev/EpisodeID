@@ -13,6 +13,10 @@ class Episode:
     episode: int
     title: str
     overview: str = ""
+    # Optional richer free metadata / reference dialogue for high-accuracy matching
+    extra_overview: str = ""
+    ref_dialogue: str = ""  # sample lines from reference SRT when available
+    runtime: int | None = None  # minutes, if known
 
     @property
     def code(self) -> str:
@@ -21,9 +25,11 @@ class Episode:
     @property
     def match_corpus(self) -> str:
         title = (self.title or "").strip()
-        overview = (self.overview or "").strip()
-        if overview:
-            return f"{title}. {overview}"
+        parts = [p for p in (self.overview, self.extra_overview) if (p or "").strip()]
+        # Deduplicate overlapping sentences lightly
+        body = " ".join(parts).strip()
+        if body:
+            return f"{title}. {body}"
         return title
 
 
