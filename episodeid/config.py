@@ -86,6 +86,11 @@ class Settings:
     ollama_base_url: str = "http://127.0.0.1:11434"
     llm_only_when_low: bool = True
     last_folder: str = ""
+    last_output_folder: str = ""
+    # Empty output_folder means "same as scan folder"
+    output_folder: str = ""
+    output_same_as_scan: bool = True
+    output_create_series_subfolder: bool = True
     last_series_id: int | None = None
     last_series_name: str = ""
     # None or 0 = all seasons; otherwise only match episodes in this season

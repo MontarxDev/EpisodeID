@@ -118,15 +118,47 @@ class MainWindow(QMainWindow):
         self.results_list.hide()
         root.addWidget(self.results_list)
 
-        # Folder
+        # Scan folder
         folder_row = QHBoxLayout()
-        folder_row.addWidget(QLabel("Folder:"))
+        folder_row.addWidget(QLabel("Scan folder:"))
         self.folder_edit = QLineEdit()
+        self.folder_edit.setPlaceholderText("Folder with all discs / nested videos…")
         folder_row.addWidget(self.folder_edit, stretch=1)
         browse = QPushButton("Browse…")
         browse.clicked.connect(self.browse_folder)
         folder_row.addWidget(browse)
         root.addLayout(folder_row)
+
+        # Output folder
+        out_row = QHBoxLayout()
+        out_row.addWidget(QLabel("Output folder:"))
+        self.output_edit = QLineEdit()
+        self.output_edit.setPlaceholderText("Where Season folders will be created…")
+        out_row.addWidget(self.output_edit, stretch=1)
+        out_browse = QPushButton("Browse…")
+        out_browse.clicked.connect(self.browse_output)
+        out_row.addWidget(out_browse)
+        self.same_as_scan = QCheckBox("Same as scan")
+        self.same_as_scan.setChecked(getattr(self.settings, "output_same_as_scan", True))
+        self.same_as_scan.toggled.connect(self._on_same_as_scan_toggled)
+        out_row.addWidget(self.same_as_scan)
+        root.addLayout(out_row)
+
+        out_opts = QHBoxLayout()
+        self.series_subfolder_check = QCheckBox("Create series subfolder under output")
+        self.series_subfolder_check.setChecked(
+            getattr(self.settings, "output_create_series_subfolder", True)
+        )
+        self.series_subfolder_check.setToolTip(
+            "e.g. Output/Star Wars The Clone Wars/Season 01/…"
+        )
+        out_opts.addWidget(self.series_subfolder_check)
+        out_opts.addStretch()
+        root.addLayout(out_opts)
+
+        if getattr(self.settings, "last_output_folder", ""):
+            self.output_edit.setText(self.settings.last_output_folder)
+        self._on_same_as_scan_toggled(self.same_as_scan.isChecked())
 
         # Options
         opt_row = QHBoxLayout()
@@ -235,9 +267,30 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(summary_text() + " · Settings saved")
 
     def browse_folder(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Select episode folder", self.folder_edit.text() or str(Path.home()))
+        path = QFileDialog.getExistingDirectory(
+            self, "Select folder to scan (all discs / subfolders)", self.folder_edit.text() or str(Path.home())
+        )
         if path:
             self.folder_edit.setText(path)
+            if self.same_as_scan.isChecked():
+                self.output_edit.setText(path)
+
+    def browse_output(self) -> None:
+        start = self.output_edit.text().strip() or self.folder_edit.text().strip() or str(Path.home())
+        path = QFileDialog.getExistingDirectory(
+            self, "Select output library folder (holds Season folders)", start
+        )
+        if path:
+            self.same_as_scan.setChecked(False)
+            self.output_edit.setText(path)
+            self.output_edit.setEnabled(True)
+
+    def _on_same_as_scan_toggled(self, checked: bool) -> None:
+        self.output_edit.setEnabled(not checked)
+        if checked:
+            scan = self.folder_edit.text().strip()
+            if scan:
+                self.output_edit.setText(scan)
 
     def _require_tmdb(self) -> str | None:
         key = get_tmdb_api_key()
@@ -316,6 +369,16 @@ class MainWindow(QMainWindow):
         self.settings.recursive_scan = self.recursive_check.isChecked()
         self.settings.rename_format = self.format_edit.text().strip() or DEFAULT_FORMAT
         self.settings.last_folder = str(folder)
+        self.settings.output_same_as_scan = self.same_as_scan.isChecked()
+        self.settings.output_create_series_subfolder = self.series_subfolder_check.isChecked()
+        if self.same_as_scan.isChecked():
+            self.settings.output_folder = str(folder)
+            self.settings.last_output_folder = str(folder)
+        else:
+            out = self.output_edit.text().strip() or str(folder)
+            self.settings.output_folder = out
+            self.settings.last_output_folder = out
+            self.output_edit.setText(out)
         sf_data = self.season_filter.currentData()
         self.settings.season_filter = int(sf_data) if sf_data else None
         if self.settings.season_filter == 0:
@@ -488,7 +551,16 @@ class MainWindow(QMainWindow):
         elif col == COL_NEW:
             row.proposed_name = item.text().strip()
 
+    def _output_root_path(self) -> Path:
+        scan = Path(self.folder_edit.text().strip() or ".")
+        if self.same_as_scan.isChecked():
+            return scan
+        out = self.output_edit.text().strip()
+        return Path(out) if out else scan
+
     def _rebuild_proposed(self, row_idx: int) -> None:
+        from episodeid.renamer import resolve_target_dir
+
         row = self.plan[row_idx]
         if row.season is None or row.episode is None or not self.series:
             return
@@ -503,13 +575,17 @@ class MainWindow(QMainWindow):
             ext=path.suffix,
             fmt=fmt,
         )
-        if self.season_check.isChecked():
-            scan_root = Path(self.folder_edit.text().strip())
-            row.target_dir = scan_root / season_dir_name(row.season)
-            row.move_to_season = True
-        else:
-            row.target_dir = path.parent
-            row.move_to_season = False
+        scan_root = Path(self.folder_edit.text().strip() or ".")
+        row.target_dir = resolve_target_dir(
+            season=row.season if self.season_check.isChecked() else None,
+            scan_root=scan_root,
+            output_root=self._output_root_path(),
+            series_name=series,
+            move_to_season=self.season_check.isChecked(),
+            create_series_subfolder=self.series_subfolder_check.isChecked(),
+            source_path=path,
+        )
+        row.move_to_season = self.season_check.isChecked()
         row.error = None
         row.selected = True
         self.table.blockSignals(True)

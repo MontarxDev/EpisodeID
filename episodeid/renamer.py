@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import re
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
@@ -65,6 +66,50 @@ def season_dir_name(season: int) -> str:
     return f"Season {season:02d}"
 
 
+def resolve_library_root(
+    *,
+    scan_root: Path,
+    output_root: Path | None = None,
+    series_name: str = "",
+    create_series_subfolder: bool = True,
+    rename_in_place: bool = False,
+) -> Path:
+    """Root directory that will hold Season XX folders (or flat renames)."""
+    if rename_in_place:
+        return scan_root
+    base = Path(output_root) if output_root else Path(scan_root)
+    if create_series_subfolder and series_name.strip():
+        return base / sanitize_filename(series_name)
+    return base
+
+
+def resolve_target_dir(
+    *,
+    season: int | None,
+    scan_root: Path,
+    output_root: Path | None = None,
+    series_name: str = "",
+    move_to_season: bool = True,
+    create_series_subfolder: bool = True,
+    rename_in_place: bool = False,
+    source_path: Path | None = None,
+) -> Path:
+    if rename_in_place and source_path is not None:
+        if move_to_season and season is not None:
+            return source_path.parent  # rare; prefer library root modes
+        return source_path.parent
+    library = resolve_library_root(
+        scan_root=scan_root,
+        output_root=output_root,
+        series_name=series_name,
+        create_series_subfolder=create_series_subfolder,
+        rename_in_place=False,
+    )
+    if move_to_season and season is not None:
+        return library / season_dir_name(season)
+    return library
+
+
 def build_plan_row(
     result: MatchResult,
     *,
@@ -75,6 +120,9 @@ def build_plan_row(
     low_threshold: float = 55.0,
     auto_threshold: float = 70.0,
     skip_already_named: bool = False,
+    output_root: Path | None = None,
+    create_series_subfolder: bool = True,
+    rename_in_place: bool = False,
 ) -> RenamePlanRow:
     path = result.path
     original = path.name
@@ -118,10 +166,18 @@ def build_plan_row(
     )
     row.proposed_name = proposed
 
-    if move_to_season:
-        row.target_dir = scan_root / season_dir_name(result.season)
-    else:
+    if rename_in_place:
         row.target_dir = path.parent
+    else:
+        row.target_dir = resolve_target_dir(
+            season=result.season,
+            scan_root=scan_root,
+            output_root=output_root,
+            series_name=series_name,
+            move_to_season=move_to_season,
+            create_series_subfolder=create_series_subfolder,
+            source_path=path,
+        )
 
     if result.confidence >= auto_threshold and "duplicate_claim" not in result.flags:
         row.selected = True
@@ -173,12 +229,22 @@ def apply_renames(
             continue
 
         dest = target_dir / row.proposed_name
-        if dest.exists() and dest.resolve() != src.resolve():
-            failures.append({"path": str(src), "error": f"Target exists: {dest.name}"})
-            continue
+        try:
+            if dest.exists() and dest.resolve() != src.resolve():
+                failures.append({"path": str(src), "error": f"Target exists: {dest.name}"})
+                continue
+            if src.resolve() == dest.resolve():
+                successes.append({"from": str(src), "to": str(dest), "note": "already in place"})
+                continue
+        except OSError:
+            pass
 
         try:
-            src.rename(dest)
+            # rename is fast same-filesystem; shutil.move works across drives
+            try:
+                src.rename(dest)
+            except OSError:
+                shutil.move(str(src), str(dest))
         except OSError as exc:
             failures.append({"path": str(src), "error": str(exc)})
             continue

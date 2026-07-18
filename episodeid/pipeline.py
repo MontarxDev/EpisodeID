@@ -40,6 +40,20 @@ def _noop_progress(_: ProgressEvent) -> None:
     return None
 
 
+def _resolve_output_root(scan_folder: Path, settings: Settings) -> Path:
+    """Library root for Season folders (or flat renames)."""
+    if getattr(settings, "rename_in_place", False):
+        return scan_folder
+    if getattr(settings, "output_same_as_scan", True):
+        return scan_folder
+    out = (getattr(settings, "output_folder", None) or "").strip()
+    if not out:
+        out = (getattr(settings, "last_output_folder", None) or "").strip()
+    if out:
+        return Path(out)
+    return scan_folder
+
+
 def _write_scan_log(plan: list[RenamePlanRow], series: SeriesInfo, folder: Path) -> Path | None:
     try:
         out_dir = data_dir() / "scans"
@@ -424,6 +438,7 @@ def scan_and_identify(
         results = demote_duplicate_claims(results)
 
     progress(ProgressEvent("plan", total, total, "Building rename plan…"))
+    output_root = _resolve_output_root(folder, settings)
     plan = build_plan(
         results,
         series_name=series.name,
@@ -433,6 +448,9 @@ def scan_and_identify(
         low_threshold=settings.low_threshold,
         auto_threshold=settings.auto_threshold,
         skip_already_named=settings.skip_already_named,
+        output_root=output_root,
+        create_series_subfolder=getattr(settings, "output_create_series_subfolder", True),
+        rename_in_place=getattr(settings, "rename_in_place", False),
     )
 
     # Multipart rename suffix
@@ -529,6 +547,7 @@ def retry_problem_rows(
     )
 
     # Rebuild only problem indices into a mini plan then splice
+    output_root = _resolve_output_root(folder, settings)
     mini = build_plan(
         problem_results,
         series_name=series.name,
@@ -538,6 +557,9 @@ def retry_problem_rows(
         low_threshold=settings.low_threshold,
         auto_threshold=settings.auto_threshold,
         skip_already_named=False,
+        output_root=output_root,
+        create_series_subfolder=getattr(settings, "output_create_series_subfolder", True),
+        rename_in_place=getattr(settings, "rename_in_place", False),
     )
     new_plan = list(plan)
     for (idx, _), new_row in zip(problems, mini):

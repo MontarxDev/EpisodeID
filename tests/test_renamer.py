@@ -48,6 +48,7 @@ def test_build_plan_and_apply(tmp_path: Path):
         series_name="Star Wars The Clone Wars",
         scan_root=tmp_path,
         move_to_season=True,
+        create_series_subfolder=False,
     )
     assert row.selected
     assert "S01E01" in row.proposed_name
