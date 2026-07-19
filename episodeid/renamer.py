@@ -437,3 +437,226 @@ def export_json(rows: list[RenamePlanRow], path: Path) -> None:
         json.dumps([r.to_dict() for r in rows], indent=2),
         encoding="utf-8",
     )
+
+
+def _claim_rank(row: RenamePlanRow) -> tuple:
+    """Higher is better when choosing the global winner for an SxxExx."""
+    trusted = 1 if (
+        "trusted_filename" in row.flags or "already_named" in row.flags
+    ) else 0
+    kind_rank = 2 if getattr(row, "row_kind", "rename") == "rename" else 1
+    selected = 1 if row.selected else 0
+    return (trusted, float(row.confidence), selected, kind_rank, float(row.sample_quality or 0))
+
+
+def apply_global_unique_assignment(rows: list[RenamePlanRow]) -> list[RenamePlanRow]:
+    """Ensure each SxxExx is claimed by at most one *selected* row across the whole plan.
+
+    Cross-disc disc-by-disc scans only de-dupe per disc; this pass runs after merge.
+    Losers are unselected and flagged ``duplicate_global`` (identity kept for review).
+    """
+    by_code: dict[tuple[int, int], list[int]] = {}
+    for i, row in enumerate(rows):
+        if row.season is None or row.episode is None:
+            continue
+        if getattr(row, "row_kind", "rename") == "inventory_skip":
+            continue
+        if row.error and not row.selected:
+            continue
+        by_code.setdefault((int(row.season), int(row.episode)), []).append(i)
+
+    for _code, idxs in by_code.items():
+        if len(idxs) < 2:
+            continue
+        ranked = sorted(idxs, key=lambda i: _claim_rank(rows[i]), reverse=True)
+        winner = ranked[0]
+        any_selected = any(rows[i].selected for i in idxs)
+        for i in ranked[1:]:
+            r = rows[i]
+            if "duplicate_global" not in r.flags:
+                r.flags.append("duplicate_global")
+            r.selected = False
+        w = rows[winner]
+        w.flags = [f for f in w.flags if f not in {"duplicate_global", "duplicate_claim"}]
+        # Trusted already-named files own the code but are not re-renamed
+        if "already_named" in w.flags or "trusted_filename" in w.flags:
+            w.selected = False
+        elif any_selected and w.confidence >= 55.0 and not w.error:
+            w.selected = True
+    return rows
+
+
+def detect_output_collisions(rows: list[RenamePlanRow]) -> list[RenamePlanRow]:
+    """Among selected rows, keep highest confidence when two would write the same path."""
+    dest_map: dict[str, list[int]] = {}
+    for i, row in enumerate(rows):
+        if not row.selected:
+            continue
+        if getattr(row, "row_kind", "rename") == "inventory_skip":
+            continue
+        if not row.proposed_name or row.season is None:
+            continue
+        dest = str((row.target_dir or Path(".")) / row.proposed_name)
+        dest_map.setdefault(dest.lower(), []).append(i)
+
+    for _dest, idxs in dest_map.items():
+        if len(idxs) < 2:
+            continue
+        ranked = sorted(idxs, key=lambda i: float(rows[i].confidence), reverse=True)
+        for i in ranked[1:]:
+            rows[i].selected = False
+            if "output_collision" not in rows[i].flags:
+                rows[i].flags.append("output_collision")
+    return rows
+
+
+def collapse_inventory_skips(rows: list[RenamePlanRow]) -> list[RenamePlanRow]:
+    """Collapse consecutive inventory_skip segments for the same mega into one parent row."""
+    out: list[RenamePlanRow] = []
+    i = 0
+    n = len(rows)
+    while i < n:
+        row = rows[i]
+        if getattr(row, "row_kind", "rename") != "inventory_skip":
+            out.append(row)
+            i += 1
+            continue
+        path = row.path
+        group = [row]
+        j = i + 1
+        while (
+            j < n
+            and getattr(rows[j], "row_kind", "rename") == "inventory_skip"
+            and rows[j].path == path
+        ):
+            group.append(rows[j])
+            j += 1
+        count = len(group)
+        reason = group[0].skip_reason or "already present"
+        if count == 1 and "collapsed_mega" in group[0].flags:
+            out.append(group[0])
+        else:
+            parent = RenamePlanRow(
+                path=path,
+                original_name=path.name if hasattr(path, "name") else str(path),
+                season=None,
+                episode=None,
+                official_title=f"{count} segment(s) skipped — {reason}",
+                confidence=0.0,
+                proposed_name=path.name if hasattr(path, "name") else str(path),
+                target_dir=group[0].target_dir,
+                selected=False,
+                move_to_season=group[0].move_to_season,
+                flags=["inventory_skip", "collapsed_mega", "skip_disc_complete"],
+                row_kind="inventory_skip",
+                skip_reason=f"{count}_segments_{reason}",
+                covered_by=group[0].covered_by,
+            )
+            out.append(parent)
+        i = j
+    return out
+
+
+def finalize_plan_rows(rows: list[RenamePlanRow]) -> list[RenamePlanRow]:
+    """Post-merge cleanup: collapse mega skips, global unique SxxExx, output collisions."""
+    rows = collapse_inventory_skips(list(rows))
+    rows = apply_global_unique_assignment(rows)
+    rows = detect_output_collisions(rows)
+    return rows
+
+
+def plan_summary_counts(rows: list[RenamePlanRow]) -> dict[str, int]:
+    """Counts for status bar / session summary."""
+    return {
+        "total": len(rows),
+        "rename": sum(
+            1 for r in rows if r.selected and getattr(r, "row_kind", "rename") == "rename"
+        ),
+        "split": sum(
+            1 for r in rows if r.selected and getattr(r, "row_kind", "rename") == "split"
+        ),
+        "inventory_skip": sum(
+            1 for r in rows if getattr(r, "row_kind", "") == "inventory_skip"
+        ),
+        "extra": sum(
+            1
+            for r in rows
+            if r.error
+            and ("no_english" in (r.error or "").lower() or "no_subtitle" in (r.error or "").lower())
+        ),
+        "review": sum(
+            1
+            for r in rows
+            if not r.selected
+            and r.season is not None
+            and not r.error
+            and getattr(r, "row_kind", "rename") != "inventory_skip"
+        ),
+        "error": sum(
+            1
+            for r in rows
+            if r.error
+            and "no_english" not in (r.error or "").lower()
+            and "no_subtitle" not in (r.error or "").lower()
+        ),
+    }
+
+
+_NATURAL_RE = re.compile(r"(\d+)")
+
+
+def natural_sort_key(name: str) -> tuple:
+    """Sort D1 before D10; useful for disc track order."""
+    parts = _NATURAL_RE.split(name or "")
+    key: list = []
+    for p in parts:
+        if p.isdigit():
+            key.append(int(p))
+        else:
+            key.append(p.casefold())
+    return tuple(key)
+
+
+def apply_disc_order_prior(
+    paths: list[Path],
+    score_matrix: list[list[float]],
+    episodes: list,
+    *,
+    boost: float = 7.0,
+) -> list[list[float]]:
+    """Soft sequential prior: boost scores when file order matches episode order.
+
+    Helps when two plots score within ~10 points on the same disc.
+    """
+    n = len(paths)
+    if n < 2 or not score_matrix or not episodes:
+        return score_matrix
+    if len(score_matrix) != n:
+        return score_matrix
+
+    sorted_file_idx = sorted(range(n), key=lambda i: natural_sort_key(paths[i].name))
+    ep_order = sorted(
+        range(len(episodes)),
+        key=lambda j: (episodes[j].season, episodes[j].episode),
+    )
+    if not ep_order:
+        return score_matrix
+
+    # When scanning a season disc, file rank ≈ episode rank among candidates
+    for rank, file_i in enumerate(sorted_file_idx):
+        if rank < len(ep_order):
+            ideal_j = ep_order[rank]
+        else:
+            ideal_j = ep_order[min(rank, len(ep_order) - 1)]
+        row = score_matrix[file_i]
+        if ideal_j < len(row):
+            row[ideal_j] = float(row[ideal_j]) + boost
+            if rank > 0 and rank - 1 < len(ep_order):
+                nj = ep_order[rank - 1]
+                if nj < len(row):
+                    row[nj] = float(row[nj]) + boost * 0.25
+            if rank + 1 < len(ep_order):
+                nj = ep_order[rank + 1]
+                if nj < len(row):
+                    row[nj] = float(row[nj]) + boost * 0.25
+    return score_matrix

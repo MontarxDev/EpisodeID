@@ -49,11 +49,22 @@ from episodeid.renamer import (
     export_csv,
     export_json,
     format_new_name,
+    plan_summary_counts,
     season_dir_name,
     undo_last,
 )
 
-COL_SEL, COL_ORIG, COL_CODE, COL_TITLE, COL_CONF, COL_NEW, COL_TARGET = range(7)
+(
+    COL_SEL,
+    COL_STATUS,
+    COL_ORIG,
+    COL_CODE,
+    COL_TITLE,
+    COL_CONF,
+    COL_NEW,
+    COL_TARGET,
+) = range(8)
+_N_COLS = 8
 
 
 class MainWindow(QMainWindow):
@@ -69,6 +80,9 @@ class MainWindow(QMainWindow):
         self._worker = None
         self._session_log = None  # SessionLog from last scan
         self._search_results: list[SeriesInfo] = []
+        self._row_map: list[int] = []  # table row → plan index
+        self._show_inventory_skips = False
+        self._show_extras = True
 
         self._build_ui()
         self._apply_theme()
@@ -205,20 +219,68 @@ class MainWindow(QMainWindow):
         self.progress_label = QLabel("Ready")
         root.addWidget(self.progress_label)
 
+        # Result filters (so S7 splits / problems are findable)
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Show:"))
+        self.view_filter = QComboBox()
+        self.view_filter.addItem("All actionable", "actionable")
+        self.view_filter.addItem("Selected only", "selected")
+        self.view_filter.addItem("Splits only", "splits")
+        self.view_filter.addItem("Problems / review", "problems")
+        self.view_filter.addItem("Everything", "all")
+        self.view_filter.setToolTip(
+            "All actionable hides mega inventory skips. Use Splits only to find S7 segments."
+        )
+        self.view_filter.currentIndexChanged.connect(self._refill_table)
+        filter_row.addWidget(self.view_filter)
+        filter_row.addWidget(QLabel("Season:"))
+        self.season_view_filter = QComboBox()
+        self.season_view_filter.addItem("All seasons", 0)
+        for n in range(1, 31):
+            self.season_view_filter.addItem(f"S{n:02d}", n)
+        self.season_view_filter.currentIndexChanged.connect(self._refill_table)
+        filter_row.addWidget(self.season_view_filter)
+        self.show_skips_check = QCheckBox("Show mega skips")
+        self.show_skips_check.setChecked(False)
+        self.show_skips_check.setToolTip(
+            "Mega multi-episode files skipped because the disc already has singles"
+        )
+        self.show_skips_check.toggled.connect(self._on_show_skips_toggled)
+        filter_row.addWidget(self.show_skips_check)
+        self.show_extras_check = QCheckBox("Show no-eng extras")
+        self.show_extras_check.setChecked(True)
+        self.show_extras_check.toggled.connect(self._on_show_extras_toggled)
+        filter_row.addWidget(self.show_extras_check)
+        filter_row.addStretch()
+        root.addLayout(filter_row)
+
         # Table
-        self.table = QTableWidget(0, 7)
+        self.table = QTableWidget(0, _N_COLS)
         self.table.setHorizontalHeaderLabels(
-            ["✓", "Original", "SxxExx", "Official Title", "Conf %", "Proposed name", "Target folder"]
+            [
+                "✓",
+                "Status",
+                "Original",
+                "SxxExx",
+                "Official Title",
+                "Conf %",
+                "Proposed name",
+                "Target folder",
+            ]
         )
         self.table.horizontalHeader().setSectionResizeMode(COL_ORIG, QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(COL_TITLE, QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(COL_NEW, QHeaderView.Stretch)
+        self.table.setColumnWidth(COL_STATUS, 72)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setAlternatingRowColors(True)
         self.table.itemChanged.connect(self._on_item_changed)
         root.addWidget(self.table, stretch=1)
 
-        legend = QLabel("Legend: green ≥70 · yellow 55–69 · red &lt;55 / error — edit cells before applying")
+        legend = QLabel(
+            "Status: OK · REVIEW · SPLIT · SKIP · EXTRA · ERROR — "
+            "green ≥70 · yellow 55–69 · red &lt;55 / error — edit before Apply"
+        )
         root.addWidget(legend)
 
         # Footer actions
@@ -439,6 +501,7 @@ class MainWindow(QMainWindow):
 
     def _on_scan_finished(self, plan: list) -> None:
         self.plan = list(plan)
+        self._populate_season_view_filter()
         self._fill_table()
         # Keep session log for apply + user review path
         if self._worker and getattr(self._worker, "session_log", None):
@@ -446,36 +509,173 @@ class MainWindow(QMainWindow):
         log_hint = ""
         if self._session_log:
             log_hint = f" · Log: {self._session_log.dir}"
-        self.progress_label.setText(
-            f"Done — {len(self.plan)} row(s). Review table, then Apply.{log_hint}"
+        counts = plan_summary_counts(self.plan)
+        summary = (
+            f"{counts['rename']} rename · {counts['split']} split · "
+            f"{counts['inventory_skip']} mega-skipped · {counts['extra']} no-eng extras · "
+            f"{counts['review']} need review"
         )
-        self.statusBar().showMessage(
-            f"Scan complete: {len(self.plan)} rows{log_hint}"
+        season_badge = self._season_badge_text()
+        self.progress_label.setText(f"Done — {summary}.{log_hint}")
+        if season_badge:
+            self.progress_label.setText(
+                self.progress_label.text() + f"  |  {season_badge}"
+            )
+        self.statusBar().showMessage(f"Scan complete: {summary}{log_hint}")
+
+    def _season_badge_text(self) -> str:
+        """Highlight seasons that only appear as splits (e.g. S07)."""
+        by_season: dict[int, list[RenamePlanRow]] = {}
+        for r in self.plan:
+            if r.season is None:
+                continue
+            if getattr(r, "row_kind", "rename") == "inventory_skip":
+                continue
+            by_season.setdefault(int(r.season), []).append(r)
+        parts = []
+        for s in sorted(by_season):
+            rows = by_season[s]
+            ready = sum(1 for r in rows if r.selected)
+            review = sum(
+                1
+                for r in rows
+                if not r.selected and not r.error and r.confidence >= self.settings.low_threshold
+            )
+            splits = sum(1 for r in rows if getattr(r, "row_kind", "") == "split")
+            if splits and ready + review > 0:
+                parts.append(f"S{s:02d}: {ready} ready · {review} review")
+        return "  ·  ".join(parts[:6])
+
+    def _populate_season_view_filter(self) -> None:
+        """Keep All + seasons that appear in the plan."""
+        present = sorted(
+            {
+                int(r.season)
+                for r in self.plan
+                if r.season is not None
+            }
         )
+        cur = self.season_view_filter.currentData()
+        self.season_view_filter.blockSignals(True)
+        self.season_view_filter.clear()
+        self.season_view_filter.addItem("All seasons", 0)
+        for n in present:
+            n_sel = sum(
+                1
+                for r in self.plan
+                if r.season == n and r.selected
+            )
+            n_all = sum(1 for r in self.plan if r.season == n)
+            self.season_view_filter.addItem(f"S{n:02d} ({n_sel}/{n_all})", n)
+        idx = self.season_view_filter.findData(cur if cur is not None else 0)
+        self.season_view_filter.setCurrentIndex(max(0, idx))
+        self.season_view_filter.blockSignals(False)
+
+    def _on_show_skips_toggled(self, checked: bool) -> None:
+        self._show_inventory_skips = checked
+        self._fill_table()
+
+    def _on_show_extras_toggled(self, checked: bool) -> None:
+        self._show_extras = checked
+        self._fill_table()
+
+    def _refill_table(self, *_args) -> None:
+        if self.plan:
+            self._fill_table()
+
+    def _filtered_plan_indices(self) -> list[int]:
+        mode = self.view_filter.currentData() or "actionable"
+        season_f = int(self.season_view_filter.currentData() or 0)
+        out: list[int] = []
+        for i, row in enumerate(self.plan):
+            kind = getattr(row, "row_kind", "rename")
+            err = (row.error or "").lower()
+            is_extra = bool(err and ("no_english" in err or "no_subtitle" in err))
+
+            # Mega inventory skips hidden unless checkbox / Everything mode
+            if kind == "inventory_skip":
+                if mode == "actionable" or mode == "selected" or mode == "splits" or mode == "problems":
+                    continue
+                if not self._show_inventory_skips and mode != "all":
+                    continue
+                if not self._show_inventory_skips and mode == "all":
+                    continue
+
+            if is_extra and not self._show_extras:
+                continue
+
+            if season_f and row.season is not None and int(row.season) != season_f:
+                continue
+            if season_f and row.season is None:
+                # Hide unseasoned rows when filtering a specific season
+                continue
+
+            if mode == "selected" and not row.selected:
+                continue
+            if mode == "splits" and kind != "split":
+                continue
+            if mode == "problems":
+                status = row.status_label(
+                    low_threshold=self.settings.low_threshold,
+                    auto_threshold=self.settings.auto_threshold,
+                )
+                if status in {"OK", "SPLIT"} and row.selected and "duplicate_global" not in row.flags:
+                    continue
+            out.append(i)
+        return out
 
     def _fill_table(self) -> None:
+        indices = self._filtered_plan_indices()
+        self._row_map = indices
         self.table.blockSignals(True)
-        self.table.setRowCount(len(self.plan))
-        for row_idx, row in enumerate(self.plan):
+        self.table.setRowCount(len(indices))
+        for row_idx, plan_i in enumerate(indices):
+            row = self.plan[plan_i]
             sel = QTableWidgetItem()
             sel.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
             sel.setCheckState(Qt.Checked if row.selected else Qt.Unchecked)
+            if getattr(row, "row_kind", "rename") == "inventory_skip":
+                sel.setFlags(Qt.ItemIsEnabled)  # not checkable
             self.table.setItem(row_idx, COL_SEL, sel)
 
-            orig = QTableWidgetItem(row.original_name)
+            status = row.status_label(
+                low_threshold=self.settings.low_threshold,
+                auto_threshold=self.settings.auto_threshold,
+            )
+            # Friendlier labels for extras / skips
+            err = (row.error or "").lower()
+            if "no_english" in err or "no_subtitle" in err:
+                status = "EXTRA"
+            status_item = QTableWidgetItem(status)
+            status_item.setFlags(status_item.flags() & ~Qt.ItemIsEditable)
+            status_item.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(row_idx, COL_STATUS, status_item)
+
+            display_name = row.original_name
+            if status == "EXTRA":
+                display_name = f"{row.original_name}  (no English subtitles)"
+            elif getattr(row, "row_kind", "") == "inventory_skip":
+                display_name = f"{row.original_name}  — skipped (already on disc)"
+            orig = QTableWidgetItem(display_name)
             orig.setFlags(orig.flags() & ~Qt.ItemIsEditable)
             self.table.setItem(row_idx, COL_ORIG, orig)
 
             code = ""
             if row.season is not None and row.episode is not None:
                 code = f"S{row.season:02d}E{row.episode:02d}"
+            elif getattr(row, "row_kind", "") == "inventory_skip":
+                code = "—"
             code_item = QTableWidgetItem(code)
             self.table.setItem(row_idx, COL_CODE, code_item)
 
             title_item = QTableWidgetItem(row.official_title)
             self.table.setItem(row_idx, COL_TITLE, title_item)
 
-            conf_item = QTableWidgetItem(f"{row.confidence:.0f}" if not row.error else "—")
+            conf_item = QTableWidgetItem(
+                f"{row.confidence:.0f}" if row.season is not None and not (
+                    row.error and getattr(row, "row_kind", "") != "split"
+                ) else ("—" if row.error or getattr(row, "row_kind", "") == "inventory_skip" else f"{row.confidence:.0f}")
+            )
             conf_item.setFlags(conf_item.flags() & ~Qt.ItemIsEditable)
             conf_item.setTextAlignment(Qt.AlignCenter)
             self.table.setItem(row_idx, COL_CONF, conf_item)
@@ -490,6 +690,7 @@ class MainWindow(QMainWindow):
 
             tip_parts = []
             kind = getattr(row, "row_kind", "rename")
+            tip_parts.append(f"Status: {status}")
             tip_parts.append(f"Kind: {kind}")
             if kind == "split" and row.split_start is not None and row.split_end is not None:
                 tip_parts.append(
@@ -499,6 +700,10 @@ class MainWindow(QMainWindow):
                 tip_parts.append(f"Skip: {row.skip_reason or 'already present'}")
                 if row.covered_by:
                     tip_parts.append(f"Already have: {row.covered_by}")
+            if "duplicate_global" in row.flags:
+                tip_parts.append("Demoted: another file claims this SxxExx (higher confidence)")
+            if "output_collision" in row.flags:
+                tip_parts.append("Demoted: would overwrite same output path")
             if row.dialogue_source:
                 tip_parts.append(f"Source: {row.dialogue_source}")
             if row.track_info:
@@ -518,19 +723,32 @@ class MainWindow(QMainWindow):
                 tip_parts.append("Dialogue sample:")
                 tip_parts.extend(f"  • {ln}" for ln in row.dialogue_lines[:8])
             tip = "\n".join(tip_parts)
-            for col in range(7):
+            for col in range(_N_COLS):
                 item = self.table.item(row_idx, col)
                 if item and tip:
                     item.setToolTip(tip)
 
-            self._color_row(row_idx, row)
+            self._color_row(row_idx, row, status=status)
         self.table.blockSignals(False)
+        visible = len(indices)
+        total = len(self.plan)
+        if visible != total:
+            self.statusBar().showMessage(
+                f"Showing {visible} of {total} rows (filters active)"
+            )
 
-    def _color_row(self, row_idx: int, row: RenamePlanRow) -> None:
+    def _color_row(self, row_idx: int, row: RenamePlanRow, status: str = "") -> None:
         theme = self.settings.theme or "light"
         system_dark = getattr(self, "_system_dark", False)
         bands = confidence_colors(theme, system_dark=system_dark)
-        if row.error:
+        kind = getattr(row, "row_kind", "rename")
+        if status == "SKIP" or kind == "inventory_skip":
+            bg_hex, fg_hex = ("#e8e8ec", "#555555") if not system_dark else ("#2a2b32", "#999999")
+        elif status == "EXTRA" or (
+            row.error and ("no_english" in (row.error or "").lower())
+        ):
+            bg_hex, fg_hex = bands["low"]
+        elif row.error:
             bg_hex, fg_hex = bands["error"]
         elif row.confidence >= 70:
             bg_hex, fg_hex = bands["high"]
@@ -540,17 +758,23 @@ class MainWindow(QMainWindow):
             bg_hex, fg_hex = bands["low"]
         bg = QColor(bg_hex)
         fg = QColor(fg_hex)
-        for col in range(7):
+        for col in range(_N_COLS):
             item = self.table.item(row_idx, col)
             if item:
                 item.setBackground(bg)
                 item.setForeground(fg)
 
+    def _plan_index(self, table_row: int) -> int | None:
+        if table_row < 0 or table_row >= len(self._row_map):
+            return None
+        return self._row_map[table_row]
+
     def _on_item_changed(self, item: QTableWidgetItem) -> None:
         row_idx = item.row()
-        if row_idx < 0 or row_idx >= len(self.plan):
+        plan_i = self._plan_index(row_idx)
+        if plan_i is None or plan_i >= len(self.plan):
             return
-        row = self.plan[row_idx]
+        row = self.plan[plan_i]
         col = item.column()
         if col == COL_SEL:
             row.selected = item.checkState() == Qt.Checked
@@ -583,7 +807,10 @@ class MainWindow(QMainWindow):
     def _rebuild_proposed(self, row_idx: int) -> None:
         from episodeid.renamer import resolve_target_dir
 
-        row = self.plan[row_idx]
+        plan_i = self._plan_index(row_idx)
+        if plan_i is None:
+            return
+        row = self.plan[plan_i]
         if row.season is None or row.episode is None or not self.series:
             return
         series = self.series.name
@@ -610,16 +837,40 @@ class MainWindow(QMainWindow):
         row.move_to_season = self.season_check.isChecked()
         row.error = None
         row.selected = True
+        status = row.status_label(
+            low_threshold=self.settings.low_threshold,
+            auto_threshold=self.settings.auto_threshold,
+        )
         self.table.blockSignals(True)
         self.table.item(row_idx, COL_TITLE).setText(row.official_title)
         self.table.item(row_idx, COL_NEW).setText(row.proposed_name)
         self.table.item(row_idx, COL_TARGET).setText(str(row.target_dir))
         self.table.item(row_idx, COL_SEL).setCheckState(Qt.Checked)
         self.table.item(row_idx, COL_CODE).setText(f"S{row.season:02d}E{row.episode:02d}")
-        self._color_row(row_idx, row)
+        if self.table.item(row_idx, COL_STATUS):
+            self.table.item(row_idx, COL_STATUS).setText(status)
+        self._color_row(row_idx, row, status=status)
         self.table.blockSignals(False)
 
     def apply_renames(self) -> None:
+        # Sync visible table edits into plan first
+        for table_i, plan_i in enumerate(self._row_map):
+            if plan_i >= len(self.plan):
+                continue
+            row = self.plan[plan_i]
+            item = self.table.item(table_i, COL_SEL)
+            if item and (item.flags() & Qt.ItemIsUserCheckable):
+                row.selected = item.checkState() == Qt.Checked
+            new_item = self.table.item(table_i, COL_NEW)
+            if new_item:
+                row.proposed_name = new_item.text().strip()
+
+        # Re-run collision check after manual edits
+        from episodeid.renamer import apply_global_unique_assignment, detect_output_collisions
+
+        apply_global_unique_assignment(self.plan)
+        detect_output_collisions(self.plan)
+
         selected = [r for r in self.plan if r.selected]
         if not selected:
             QMessageBox.information(self, "Apply", "No rows selected.")
@@ -639,15 +890,6 @@ class MainWindow(QMainWindow):
         )
         if reply != QMessageBox.Yes:
             return
-
-        # sync selection from table
-        for i, row in enumerate(self.plan):
-            item = self.table.item(i, COL_SEL)
-            if item:
-                row.selected = item.checkState() == Qt.Checked
-            new_item = self.table.item(i, COL_NEW)
-            if new_item:
-                row.proposed_name = new_item.text().strip()
 
         self.apply_btn.setEnabled(False)
         self._thread = QThread(self)

@@ -135,6 +135,9 @@ def load_settings(path: Path | None = None) -> Settings:
         data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             return Settings()
+        # Migrate: older installs / missing key → trust already-named (fast re-scan)
+        if "skip_already_named" not in data:
+            data["skip_already_named"] = True
         return Settings.from_dict(data)
     except (OSError, json.JSONDecodeError):
         return Settings()

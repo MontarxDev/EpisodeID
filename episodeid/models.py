@@ -123,6 +123,36 @@ class RenamePlanRow:
             return None
         return f"S{self.season:02d}E{self.episode:02d}"
 
+    def status_label(self, *, low_threshold: float = 55.0, auto_threshold: float = 70.0) -> str:
+        """UI status: OK | REVIEW | SKIP | EXTRA | SPLIT | ERROR."""
+        kind = getattr(self, "row_kind", "rename") or "rename"
+        err = (self.error or "").lower()
+        if kind == "inventory_skip":
+            return "SKIP"
+        if err and ("no_english" in err or "no_subtitle" in err):
+            return "EXTRA"
+        if self.error and kind != "split":
+            return "ERROR"
+        if kind == "split":
+            if self.error:
+                return "ERROR"
+            if self.selected:
+                return "SPLIT"
+            if self.season is not None and self.confidence >= low_threshold:
+                return "REVIEW"
+            return "ERROR" if self.season is None else "REVIEW"
+        if self.season is None and self.episode is None:
+            return "ERROR" if self.error else "ERROR"
+        if "duplicate_global" in self.flags or "output_collision" in self.flags:
+            return "REVIEW"
+        if self.selected and self.confidence >= auto_threshold:
+            return "OK"
+        if self.selected or (
+            self.season is not None and self.confidence >= low_threshold
+        ):
+            return "REVIEW"
+        return "ERROR" if self.error else "REVIEW"
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "path": str(self.path),
@@ -146,6 +176,7 @@ class RenamePlanRow:
             "split_end": self.split_end,
             "skip_reason": self.skip_reason,
             "covered_by": self.covered_by,
+            "status": self.status_label(),
         }
 
 

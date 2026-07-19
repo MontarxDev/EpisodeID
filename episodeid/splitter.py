@@ -167,15 +167,23 @@ def cluster_chapters_into_episodes(
 def auto_grid_segments(
     file_duration: float,
     expected_runtime_min: float = 22.0,
+    *,
+    force_n: int | None = None,
 ) -> list[tuple[float, float]]:
     target = max(8.0, expected_runtime_min) * 60.0
-    if file_duration < target * 1.5:
+    if file_duration < target * 1.5 and not force_n:
         return [(0.0, file_duration)]
-    n = max(2, int(round(file_duration / target)))
-    # Adjust n so remainder isn't tiny
+    if force_n is not None and force_n >= 2:
+        n = force_n
+    else:
+        n = max(2, int(round(file_duration / target)))
+    # Adjust n so remainder isn't tiny (unless forced)
     seg = file_duration / n
-    while n > 2 and seg < target * 0.55:
-        n -= 1
+    if force_n is None:
+        while n > 2 and seg < target * 0.55:
+            n -= 1
+            seg = file_duration / n
+    else:
         seg = file_duration / n
     segs: list[tuple[float, float]] = []
     for i in range(n):
@@ -185,17 +193,34 @@ def auto_grid_segments(
     return segs
 
 
+def expected_segment_count(
+    file_duration: float,
+    expected_runtime_min: float = 22.0,
+) -> int:
+    """Estimate how many episodes fit in a multi-ep file from duration."""
+    target = max(8.0, expected_runtime_min) * 60.0
+    if file_duration <= 0 or target <= 0:
+        return 1
+    return max(1, int(round(file_duration / target)))
+
+
 def inventory_segments(
     path: Path,
     *,
     expected_runtime_min: float = 22.0,
 ) -> list[SplitSegment]:
-    """Build un-identified segments for a multi-episode file."""
+    """Build un-identified segments for a multi-episode file.
+
+    Prefers chapter clustering, but if chapters under-segment relative to
+    duration/median runtime (common on S7 mega files), forces a duration grid.
+    """
     path = Path(path)
     duration = probe_duration_seconds(path)
     if duration <= 0:
         return []
+    expected_n = expected_segment_count(duration, expected_runtime_min)
     chapters = probe_chapters(path)
+    method = "auto"
     if chapters:
         pairs = cluster_chapters_into_episodes(
             chapters,
@@ -203,8 +228,24 @@ def inventory_segments(
             expected_runtime_min=expected_runtime_min,
         )
         method = "chapters"
+        # Under-segmented vs duration estimate → force equal grid
+        if expected_n >= 3 and len(pairs) < expected_n - 1:
+            pairs = auto_grid_segments(
+                duration, expected_runtime_min, force_n=expected_n
+            )
+            method = "auto_forced"
+        # Over-fragmented (too many short pieces) also re-grid
+        elif len(pairs) >= expected_n + 2 and expected_n >= 2:
+            pairs = auto_grid_segments(
+                duration, expected_runtime_min, force_n=expected_n
+            )
+            method = "auto_forced"
     else:
-        pairs = auto_grid_segments(duration, expected_runtime_min)
+        pairs = auto_grid_segments(
+            duration,
+            expected_runtime_min,
+            force_n=expected_n if expected_n >= 2 else None,
+        )
         method = "auto"
 
     return [

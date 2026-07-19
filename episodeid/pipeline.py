@@ -40,7 +40,13 @@ from episodeid.matcher import (
 from episodeid.metadata import TMDBClient
 from episodeid.models import Episode, MatchResult, ProgressEvent, RenamePlanRow, SeriesInfo
 from episodeid.refsubs import attach_reference_subs
-from episodeid.renamer import build_plan, is_already_named
+from episodeid.renamer import (
+    apply_disc_order_prior,
+    build_plan,
+    finalize_plan_rows,
+    is_already_named,
+    plan_summary_counts,
+)
 from episodeid.tvmaze import enrich_episodes_with_tvmaze
 
 ProgressCb = Callable[[ProgressEvent], None]
@@ -410,10 +416,22 @@ def scan_and_identify(
             slog.log("disc_end", f"Finished {disc.name}", rows=len(part))
         _progress(
             ProgressEvent(
+                "plan",
+                len(discs),
+                len(discs),
+                "Global unique assignment + collision check…",
+            )
+        )
+        combined = finalize_plan_rows(combined)
+        counts = plan_summary_counts(combined)
+        _progress(
+            ProgressEvent(
                 "done",
                 len(discs),
                 len(discs),
-                f"All discs done — {len(combined)} plan row(s)",
+                f"All discs done — {counts['rename']} rename · {counts['split']} split · "
+                f"{counts['inventory_skip']} mega-skipped · {counts['extra']} no-eng extras "
+                f"({len(combined)} rows)",
             )
         )
         md = slog.finalize_scan(
@@ -422,7 +440,11 @@ def scan_and_identify(
             folder=str(folder),
             output_root=str(output_root),
             plan=combined,
-            extra={"mode": "disc_by_disc", "disc_count": len(discs)},
+            extra={
+                "mode": "disc_by_disc",
+                "disc_count": len(discs),
+                "counts": counts,
+            },
         )
         _progress(ProgressEvent("done", len(combined), len(combined), f"Review log: {md}"))
         return combined
@@ -475,15 +497,25 @@ def scan_and_identify(
         season_hint=season_hint,
         library_root=folder,
     )
+    plan = finalize_plan_rows(plan)
+    counts = plan_summary_counts(plan)
     md = slog.finalize_scan(
         series_name=series.name,
         series_id=series.id,
         folder=str(folder),
         output_root=str(output_root),
         plan=plan,
-        extra={"mode": "single_tree", "season_hint": season_hint},
+        extra={"mode": "single_tree", "season_hint": season_hint, "counts": counts},
     )
-    _progress(ProgressEvent("done", len(plan), len(plan), f"Review log: {md}"))
+    _progress(
+        ProgressEvent(
+            "done",
+            len(plan),
+            len(plan),
+            f"{counts['rename']} rename · {counts['split']} split · "
+            f"{counts['inventory_skip']} mega-skipped · Review log: {md}",
+        )
+    )
     return plan
 
 
@@ -609,6 +641,10 @@ def _scan_one_tree(
         match, scores = _process_one_file(path, episodes, settings, series)
         results.append(match)
         score_matrix.append(scores)
+
+    # Soft sequential prior from filename order on disc (D1, D2, …)
+    if singles and score_matrix:
+        score_matrix = apply_disc_order_prior(singles, score_matrix, episodes)
 
     progress(ProgressEvent("plan", total_a, total_a, "Resolving unique assignments for singles…"))
     results = reassign_unique_episodes(
@@ -737,6 +773,11 @@ def _scan_one_tree(
                 except OSError:
                     continue
 
+            # Season locked from disc folder (e.g. S7_D1) → select splits at low_threshold
+            season_locked = season_hint is not None and getattr(
+                settings, "auto_season_from_folder", True
+            )
+
             if skip_covered and segs and disc_singles >= len(segs):
                 progress(
                     ProgressEvent(
@@ -747,29 +788,46 @@ def _scan_one_tree(
                         f"episode file(s) ≥ {len(segs)} segment(s)",
                     )
                 )
-                for seg in segs:
-                    seg.skip = True
-                    seg.skip_reason = "disc_has_enough_singles"
-                    seg.flags.append("skip_disc_complete")
-            else:
-                for si, seg in enumerate(segs, start=1):
-                    progress(
-                        ProgressEvent(
-                            "match",
-                            si,
-                            len(segs),
-                            f"Identify segment {si}/{len(segs)} in {mpath.name} "
-                            f"({seg.start/60:.1f}–{seg.end/60:.1f}m)",
-                            path=str(mpath),
-                        )
+                # One collapsed parent row (not N blank "unknown" segment rows)
+                split_rows.append(
+                    RenamePlanRow(
+                        path=mpath,
+                        original_name=mpath.name,
+                        season=None,
+                        episode=None,
+                        official_title=(
+                            f"{len(segs)} segment(s) skipped — disc already has singles"
+                        ),
+                        confidence=0.0,
+                        proposed_name=mpath.name,
+                        target_dir=output_root,
+                        selected=False,
+                        move_to_season=settings.move_to_season,
+                        flags=["inventory_skip", "collapsed_mega", "skip_disc_complete"],
+                        row_kind="inventory_skip",
+                        skip_reason="disc_has_enough_singles",
                     )
-                    identify_segment(
-                        seg,
-                        episodes,
-                        low_threshold=settings.low_threshold,
-                        auto_threshold=settings.auto_threshold,
+                )
+                continue
+
+            for si, seg in enumerate(segs, start=1):
+                progress(
+                    ProgressEvent(
+                        "match",
+                        si,
+                        len(segs),
+                        f"Identify segment {si}/{len(segs)} in {mpath.name} "
+                        f"({seg.start/60:.1f}–{seg.end/60:.1f}m)",
+                        path=str(mpath),
                     )
-                segs = apply_covered_filter(segs, covered, skip_if_covered=skip_covered)
+                )
+                identify_segment(
+                    seg,
+                    episodes,
+                    low_threshold=settings.low_threshold,
+                    auto_threshold=settings.auto_threshold,
+                )
+            segs = apply_covered_filter(segs, covered, skip_if_covered=skip_covered)
 
             for seg in segs:
                 proposed = ""
@@ -803,19 +861,27 @@ def _scan_one_tree(
                     flags = list(seg.flags) + ["inventory_skip"]
                 else:
                     kind = "split"
-                    # Stricter than renames: avoid bad plot-only IDs creating junk files
-                    selected = (
+                    flags = list(seg.flags) + ["split_segment"]
+                    conf_ok = (
                         seg.season is not None
                         and not seg.error
-                        and seg.confidence >= settings.auto_threshold
+                        and seg.confidence >= (
+                            settings.low_threshold
+                            if season_locked
+                            else settings.auto_threshold
+                        )
                     )
-                    flags = list(seg.flags) + ["split_segment"]
+                    selected = conf_ok
                     if (
                         seg.season is not None
                         and not seg.error
-                        and settings.low_threshold <= seg.confidence < settings.auto_threshold
+                        and settings.low_threshold
+                        <= seg.confidence
+                        < settings.auto_threshold
                     ):
                         flags.append("review")
+                        if season_locked:
+                            flags.append("season_locked_split")
 
                 # Mark covered so later megas don't re-propose
                 if selected and seg.season is not None and seg.episode is not None:
@@ -850,20 +916,15 @@ def _scan_one_tree(
                 )
 
     plan = list(plan) + split_rows
+    # Per-tree finalize (global again after disc merge)
+    plan = finalize_plan_rows(plan)
 
-    ok = sum(1 for r in plan if r.selected and r.row_kind == "rename")
-    splits = sum(1 for r in plan if r.selected and r.row_kind == "split")
-    skipped_inv = sum(1 for r in plan if r.row_kind == "inventory_skip")
-    review = sum(
-        1
-        for r in plan
-        if not r.selected and r.season and not r.error and r.row_kind != "inventory_skip"
-    )
-    failed = sum(1 for r in plan if r.error or (r.season is None and r.row_kind == "rename"))
+    counts = plan_summary_counts(plan)
     log_path = _write_scan_log(plan, series, folder)
     msg = (
-        f"Matched {ok} · Splits {splits} · Skipped inventory {skipped_inv} · "
-        f"Review {review} · Failed {failed}"
+        f"Matched {counts['rename']} · Splits {counts['split']} · "
+        f"Mega-skipped {counts['inventory_skip']} · Review {counts['review']} · "
+        f"No-eng extras {counts['extra']}"
     )
     if log_path:
         msg += f" · log {log_path.name}"
