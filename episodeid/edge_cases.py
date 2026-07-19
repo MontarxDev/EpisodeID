@@ -123,6 +123,9 @@ def mark_content_duplicates(results: list[MatchResult], threshold: float = 90.0)
 
 
 def is_problem_result(r: MatchResult) -> bool:
+    # Season-disc layout identities are fixed; auto-resolve must not re-open holes
+    if "sequential_disc" in (r.flags or []):
+        return False
     if r.error:
         return True
     bad_flags = {

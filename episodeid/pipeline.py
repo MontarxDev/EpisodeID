@@ -363,7 +363,11 @@ def _second_pass_resolve(
     episodes: list[Episode],
     settings: Settings,
 ) -> list[MatchResult]:
-    """Re-assign problem rows against still-free episodes."""
+    """Re-assign problem rows against still-free episodes.
+
+    Never rewrites layout-backed ``sequential_disc`` identities — that reopened
+    mid-block holes (S05 E01–E04 then E06–E08) and parked orphans on later discs.
+    """
     if not settings.auto_resolve_problems:
         return results
 
@@ -378,6 +382,9 @@ def _second_pass_resolve(
             and not r.error
         ):
             assigned.add((r.season, r.episode))
+        # Layout-backed rows always occupy their slot even if mid confidence
+        if "sequential_disc" in (r.flags or []) and r.season is not None and r.episode is not None:
+            assigned.add((int(r.season), int(r.episode)))
 
     # Multipart exceptions: same SxxExx allowed
     multipart_ok: set[tuple[int, int]] = set()
@@ -387,7 +394,11 @@ def _second_pass_resolve(
         if any(f.startswith("multipart") for f in r.flags):
             multipart_ok.add((r.season, r.episode))
 
-    problem_idx = [i for i, r in enumerate(results) if is_problem_result(r)]
+    problem_idx = [
+        i
+        for i, r in enumerate(results)
+        if is_problem_result(r) and "sequential_disc" not in (r.flags or [])
+    ]
     if not problem_idx:
         return results
 
@@ -421,7 +432,7 @@ def _second_pass_resolve(
         r.season = ep.season
         r.episode = ep.episode
         r.title = ep.title
-        r.confidence = round(sc, 1)
+        r.confidence = round(min(100.0, float(sc)), 1)
         r.error = None
         r.low_confidence = sc < settings.low_threshold
         flags = [f for f in r.flags if f not in {"duplicate_claim", "no_match", "low_confidence"}]

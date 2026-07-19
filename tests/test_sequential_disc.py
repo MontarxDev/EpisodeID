@@ -140,3 +140,62 @@ def test_strict_no_skip_e05_in_seven_track_block():
     matrix[4][5] = 95.0  # E06 strong for C5
     out = reassign_sequential_disc(results, episodes, paths, matrix, order_penalty=20.0)
     assert [r.episode for r in out] == list(range(1, 8))
+
+
+def test_second_pass_cannot_reopen_sequential_hole():
+    """Auto-resolve must not rewrite sequential_disc rows (S05E05 parked on D3)."""
+    from episodeid.config import Settings
+    from episodeid.edge_cases import is_problem_result
+    from episodeid.pipeline import _second_pass_resolve
+
+    episodes = _eps(1, 20)
+    paths = [Path(f"C{i}_t0{i}.mkv") for i in range(1, 8)]
+    results = []
+    matrix = []
+    for i, p in enumerate(paths):
+        r = MatchResult(
+            path=p,
+            season=1,
+            episode=i + 1,
+            title=f"T{i+1}",
+            confidence=75.0,
+            low_confidence=False,
+            sample_quality=90,
+            flags=["sequential_disc", "sequential_prior", "assigned_unique", "possibly_partial"],
+        )
+        results.append(r)
+        row = [20.0] * 20
+        row[i] = 75.0
+        # Tempt reassignment of C5 (index 4) to E06
+        if i == 4:
+            row[4] = 40.0
+            row[5] = 99.0
+            r.low_confidence = True
+            r.flags = list(r.flags) + ["low_confidence"]
+        matrix.append(row)
+
+    # sequential_disc is never a "problem" for auto-resolve
+    assert is_problem_result(results[4]) is False
+
+    settings = Settings(auto_resolve_problems=True)
+    out = _second_pass_resolve(results, matrix, episodes, settings)
+    assert [r.episode for r in out] == list(range(1, 8))
+    assert out[4].episode == 5
+
+
+def test_gappy_free_later_disc_does_not_start_with_orphan_e05():
+    """After E01–E04,E06–E08 taken, free=[E05,E16..]; 5 late tracks use E16–E20 not E05 first."""
+    episodes = [Episode(5, e, f"T{e}") for e in range(1, 21)]
+    blocked = {(5, e) for e in [1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]}
+    free_j = [j for j, ep in enumerate(episodes) if (ep.season, ep.episode) not in blocked]
+    block = pick_primary_free_block(free_j, episodes, n_tracks=5)
+    assert [episodes[j].episode for j in block] == [16, 17, 18, 19, 20]
+
+    paths = [Path(f"C{i}_t0{i}.mkv") for i in range(1, 6)]
+    results = [MatchResult(path=p, sample_quality=90) for p in paths]
+    matrix = [[50.0] * 20 for _ in paths]
+    out = reassign_sequential_disc(
+        results, episodes, paths, matrix, blocked=blocked, order_penalty=20.0
+    )
+    assert [r.episode for r in out] == [16, 17, 18, 19, 20]
+    assert 5 not in [r.episode for r in out]
