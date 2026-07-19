@@ -205,8 +205,9 @@ class MainWindow(QMainWindow):
         idx = self.season_filter.findData(int(sf))
         self.season_filter.setCurrentIndex(max(0, idx))
         self.season_filter.setToolTip(
-            "Limit matching to one season (recommended for DVD disc folders). "
-            "Also limits which reference subtitles are fetched/cached."
+            "Limit to one season: only matching disc folders (e.g. S5_D*) are scanned "
+            "in disc-by-disc mode, and only that season’s catalog is used. "
+            "Use this to debug a single season without scanning the full library."
         )
         opt_row.addWidget(self.season_filter)
         opt_row.addWidget(QLabel("Format:"))
