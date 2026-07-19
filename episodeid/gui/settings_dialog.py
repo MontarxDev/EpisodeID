@@ -47,7 +47,8 @@ class SettingsDialog(QDialog):
     def __init__(self, settings: Settings, parent=None):
         super().__init__(parent)
         self.setWindowTitle("EpisodeID Settings")
-        self.setMinimumWidth(560)
+        self.setMinimumWidth(620)
+        self.setMinimumHeight(480)
         self.settings = settings
 
         tabs = QTabWidget()

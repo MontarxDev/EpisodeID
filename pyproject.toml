@@ -41,6 +41,9 @@ Documentation = "https://github.com/example/episodeid#readme"
 [tool.setuptools.packages.find]
 include = ["episodeid*"]
 
+[tool.setuptools.package-data]
+episodeid = ["gui/assets/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

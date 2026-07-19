@@ -101,12 +101,21 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
+        root.setContentsMargins(16, 14, 16, 12)
+        root.setSpacing(10)
 
         # Toolbar row
         top = QHBoxLayout()
-        title = QLabel(f"<b>{__app_name__}</b>")
-        title.setStyleSheet("font-size: 18px;")
-        top.addWidget(title)
+        top.setSpacing(8)
+        title_col = QVBoxLayout()
+        title_col.setSpacing(0)
+        title = QLabel(__app_name__)
+        title.setObjectName("appTitle")
+        subtitle = QLabel(f"v{__version__} · identify & rename from dialogue")
+        subtitle.setObjectName("appSubtitle")
+        title_col.addWidget(title)
+        title_col.addWidget(subtitle)
+        top.addLayout(title_col)
         top.addStretch()
         self.settings_btn = QPushButton("Settings")
         self.settings_btn.clicked.connect(self.open_settings)
@@ -215,12 +224,14 @@ class MainWindow(QMainWindow):
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
+        self.progress.setTextVisible(True)
         root.addWidget(self.progress)
         self.progress_label = QLabel("Ready")
+        self.progress_label.setObjectName("progressLabel")
         root.addWidget(self.progress_label)
         self.coverage_label = QLabel("")
+        self.coverage_label.setObjectName("coverageLabel")
         self.coverage_label.setWordWrap(True)
-        self.coverage_label.setStyleSheet("font-weight: 600;")
         self.coverage_label.hide()
         root.addWidget(self.coverage_label)
 
@@ -276,9 +287,15 @@ class MainWindow(QMainWindow):
         self.table.horizontalHeader().setSectionResizeMode(COL_ORIG, QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(COL_TITLE, QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(COL_NEW, QHeaderView.Stretch)
-        self.table.setColumnWidth(COL_STATUS, 72)
+        self.table.setColumnWidth(COL_SEL, 40)
+        self.table.setColumnWidth(COL_STATUS, 78)
+        self.table.setColumnWidth(COL_CODE, 80)
+        self.table.setColumnWidth(COL_CONF, 64)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(False)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(32)
         self.table.itemChanged.connect(self._on_item_changed)
         root.addWidget(self.table, stretch=1)
 
@@ -286,10 +303,12 @@ class MainWindow(QMainWindow):
             "Status: OK · REVIEW · SPLIT · SKIP · EXTRA · ERROR — "
             "green ≥70 · yellow 55–69 · red &lt;55 / error — edit before Apply"
         )
+        legend.setObjectName("legend")
         root.addWidget(legend)
 
         # Footer actions
         foot = QHBoxLayout()
+        foot.setSpacing(8)
         self.export_btn = QPushButton("Export CSV/JSON")
         self.export_btn.clicked.connect(self.export_report)
         foot.addWidget(self.export_btn)
@@ -694,6 +713,7 @@ class MainWindow(QMainWindow):
             sel = QTableWidgetItem()
             sel.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
             sel.setCheckState(Qt.Checked if row.selected else Qt.Unchecked)
+            sel.setTextAlignment(Qt.AlignCenter)
             if getattr(row, "row_kind", "rename") == "inventory_skip":
                 sel.setFlags(Qt.ItemIsEnabled)  # not checkable
             self.table.setItem(row_idx, COL_SEL, sel)
@@ -800,10 +820,11 @@ class MainWindow(QMainWindow):
     def _color_row(self, row_idx: int, row: RenamePlanRow, status: str = "") -> None:
         theme = self.settings.theme or "light"
         system_dark = getattr(self, "_system_dark", False)
+        dark = theme == "dark" or (theme == "system" and system_dark)
         bands = confidence_colors(theme, system_dark=system_dark)
         kind = getattr(row, "row_kind", "rename")
         if status == "SKIP" or kind == "inventory_skip":
-            bg_hex, fg_hex = ("#e8e8ec", "#555555") if not system_dark else ("#2a2b32", "#999999")
+            bg_hex, fg_hex = ("#e8e8ec", "#555555") if not dark else ("#2a2b32", "#999999")
         elif status == "EXTRA" or (
             row.error and ("no_english" in (row.error or "").lower())
         ):
@@ -818,9 +839,16 @@ class MainWindow(QMainWindow):
             bg_hex, fg_hex = bands["low"]
         bg = QColor(bg_hex)
         fg = QColor(fg_hex)
+        # Keep select-column neutral so blue checkboxes stay high-contrast
+        sel_bg = QColor(bands.get("select", ("#ffffff", "#111111"))[0])
         for col in range(_N_COLS):
             item = self.table.item(row_idx, col)
-            if item:
+            if not item:
+                continue
+            if col == COL_SEL:
+                item.setBackground(sel_bg)
+                item.setForeground(fg)
+            else:
                 item.setBackground(bg)
                 item.setForeground(fg)
 
