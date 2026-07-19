@@ -129,8 +129,12 @@ class RenamePlanRow:
         err = (self.error or "").lower()
         if kind == "inventory_skip":
             return "SKIP"
+        if "likely_extra" in self.flags or err in {"likely_extra"}:
+            return "EXTRA"
         if err and ("no_english" in err or "no_subtitle" in err):
             return "EXTRA"
+        if "duplicate_global" in self.flags:
+            return "DUP"
         if self.error and kind != "split":
             return "ERROR"
         if kind == "split":

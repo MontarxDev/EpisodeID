@@ -415,14 +415,22 @@ def reassign_unique_episodes(
     score_matrix: list[list[float]] | None = None,
     low_threshold: float = 55.0,
     auto_threshold: float = 70.0,
+    blocked: set[tuple[int, int]] | None = None,
 ) -> list[MatchResult]:
     """Greedy unique file→episode assignment maximizing scores.
 
     ``score_matrix[i][j]`` is score of results[i] vs episodes[j].
-    When provided, rewrites season/episode/title/confidence for non-error rows.
+    ``blocked`` episodes (already covered by prior discs / library) are never assigned.
     """
     if not results or not episodes or not score_matrix:
         return demote_duplicate_claims(results)
+
+    blocked = blocked or set()
+    blocked_j = {
+        j
+        for j, ep in enumerate(episodes)
+        if (int(ep.season), int(ep.episode)) in blocked
+    }
 
     # Build candidate pairs (score, file_idx, ep_idx)
     pairs: list[tuple[float, int, int]] = []
@@ -431,13 +439,27 @@ def reassign_unique_episodes(
             continue
         if results[i].sample_quality and results[i].sample_quality < 30:
             continue
+        # Trusted filenames keep their identity — pin them
+        if "trusted_filename" in (results[i].flags or []) and results[i].season is not None:
+            continue
         for j, sc in enumerate(row_scores):
+            if j in blocked_j:
+                continue
             if sc >= max(25.0, low_threshold * 0.4):
                 pairs.append((sc, i, j))
     pairs.sort(reverse=True, key=lambda x: x[0])
 
     used_files: set[int] = set()
     used_eps: set[int] = set()
+    # Pin trusted
+    for i, result in enumerate(results):
+        if "trusted_filename" in (result.flags or []) and result.season is not None:
+            used_files.add(i)
+            for j, ep in enumerate(episodes):
+                if ep.season == result.season and ep.episode == result.episode:
+                    used_eps.add(j)
+                    break
+
     assignment: dict[int, tuple[int, float]] = {}
     for sc, i, j in pairs:
         if i in used_files or j in used_eps:
@@ -454,7 +476,7 @@ def reassign_unique_episodes(
         result.season = ep.season
         result.episode = ep.episode
         result.title = ep.title
-        result.confidence = round(sc, 1)
+        result.confidence = round(max(0.0, min(100.0, float(sc))), 1)
         result.low_confidence = sc < low_threshold
         result.error = None
         flags = [f for f in result.flags if f not in {"duplicate_claim", "low_confidence", "review", "no_match"}]
@@ -467,9 +489,8 @@ def reassign_unique_episodes(
         if "assigned_unique" not in flags:
             flags.append("assigned_unique")
         result.flags = flags
-        # Refresh top candidates from this row's scores
         ranked = sorted(
-            ((score_matrix[i][k], episodes[k]) for k in range(len(episodes))),
+            ((score_matrix[i][k], episodes[k]) for k in range(len(episodes)) if k not in blocked_j),
             key=lambda x: x[0],
             reverse=True,
         )[:3]
@@ -478,7 +499,7 @@ def reassign_unique_episodes(
                 season=ep.season,
                 episode=ep.episode,
                 title=ep.title,
-                confidence=round(sc, 1),
+                confidence=round(min(100.0, float(sc)), 1),
             )
             for sc, ep in ranked
         ]

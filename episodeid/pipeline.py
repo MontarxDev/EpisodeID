@@ -52,7 +52,9 @@ from episodeid.renamer import (
     finalize_plan_rows,
     is_already_named,
     plan_summary_counts,
+    source_folder_label,
 )
+from episodeid.splitter import scan_output_library_for_episodes as _scan_lib_eps
 from episodeid.tvmaze import enrich_episodes_with_tvmaze
 
 ProgressCb = Callable[[ProgressEvent], None]
@@ -343,6 +345,12 @@ def _process_one_file(
                     llm_match.flags.append("llm")
                 match = llm_match
 
+    # Keep dialogue for global reassignment after demote
+    if all_lines:
+        match.dialogue_lines = list(all_lines[:40])
+    elif sample.lines and not match.dialogue_lines:
+        match.dialogue_lines = list(sample.lines[:40])
+    match.confidence = max(0.0, min(100.0, float(match.confidence or 0)))
     exp_rt = _expected_runtime(episodes, match.season, match.episode)
     match = apply_file_flags(match, duration_sec=duration, expected_runtime=exp_rt, path=path)
     return match, scores
@@ -496,6 +504,16 @@ def scan_and_identify(
             )
         )
         combined: list[RenamePlanRow] = []
+        # Shared covered set so late discs claim free slots (E16+) not E01 again
+        library_covered: dict[tuple[int, int], str] = {}
+        if getattr(settings, "skip_split_if_in_output_library", True):
+            lib_root = output_root
+            if getattr(settings, "output_create_series_subfolder", True):
+                from episodeid.renamer import sanitize_filename
+
+                lib_root = output_root / sanitize_filename(series.name)
+            library_covered.update(_scan_lib_eps(lib_root))
+
         for di, disc in enumerate(discs, start=1):
             if cancel_check():
                 break
@@ -507,6 +525,8 @@ def scan_and_identify(
             label = f"Disc {di}/{len(discs)}: {disc.name}"
             if season_hint:
                 label += f" (auto S{season_hint:02d})"
+            if library_covered:
+                label += f" · {len(library_covered)} eps already covered"
             _progress(ProgressEvent("scan", di, len(discs), label))
             slog.log("disc_start", label, path=str(disc), season_hint=season_hint)
             disc_eps = all_episodes
@@ -524,18 +544,32 @@ def scan_and_identify(
                 cancel_check=cancel_check,
                 season_hint=season_hint,
                 library_root=folder,
+                precovered=dict(library_covered),
             )
             combined.extend(part)
+            # Accumulate covered from this disc
+            for row in part:
+                if row.season is None or row.episode is None:
+                    continue
+                if row.selected or "trusted_filename" in row.flags or "already_named" in row.flags:
+                    if "duplicate_global" not in row.flags and "likely_extra" not in row.flags:
+                        library_covered[(int(row.season), int(row.episode))] = str(row.path)
             slog.log("disc_end", f"Finished {disc.name}", rows=len(part))
         _progress(
             ProgressEvent(
                 "plan",
                 len(discs),
                 len(discs),
-                "Global unique assignment + collision check…",
+                "Global unique + reassign free slots…",
             )
         )
-        combined = finalize_plan_rows(combined)
+        combined = finalize_plan_rows(
+            combined,
+            catalog=all_episodes,
+            low_threshold=settings.low_threshold,
+            auto_threshold=settings.auto_threshold,
+            series_name=series.name,
+        )
         counts = plan_summary_counts(combined)
         _, cov_summary, cov_dicts = _compute_coverage(
             combined,
@@ -617,7 +651,13 @@ def scan_and_identify(
         season_hint=season_hint,
         library_root=folder,
     )
-    plan = finalize_plan_rows(plan)
+    plan = finalize_plan_rows(
+        plan,
+        catalog=all_episodes,
+        low_threshold=settings.low_threshold,
+        auto_threshold=settings.auto_threshold,
+        series_name=series.name,
+    )
     counts = plan_summary_counts(plan)
     _, cov_summary, cov_dicts = _compute_coverage(
         plan,
@@ -682,6 +722,36 @@ def _attach_refs_for_episodes(
         progress(ProgressEvent("metadata", 0, 1, f"Reference subs skipped: {exc}"))
 
 
+def _is_likely_extra_path(path: Path, *, duration_sec: float, median_runtime_min: float) -> bool:
+    """Heuristics for commentary / bonus / non-episode tracks."""
+    name = path.name.lower()
+    if any(
+        k in name
+        for k in (
+            "comment",
+            "bonus",
+            "extra",
+            "trailer",
+            "interview",
+            "featurette",
+            "behind",
+            "menu",
+            "preview",
+        )
+    ):
+        return True
+    # Short vs expected episode length
+    if median_runtime_min > 0 and duration_sec > 0:
+        if duration_sec < median_runtime_min * 60.0 * 0.55:
+            return True
+    # On these DVD dumps, E*_t* are often extras when short
+    import re
+
+    if re.match(r"(?i)^e\d+_t\d+", path.name) and duration_sec < max(600.0, median_runtime_min * 40):
+        return True
+    return False
+
+
 def _scan_one_tree(
     *,
     folder: Path,
@@ -693,9 +763,11 @@ def _scan_one_tree(
     cancel_check: Callable[[], bool],
     season_hint: int | None,
     library_root: Path,
+    precovered: dict[tuple[int, int], str] | None = None,
 ) -> list[RenamePlanRow]:
     """Pass A/B scan for one disc folder or single tree."""
     _attach_refs_for_episodes(episodes, series, settings, progress)
+    precovered = dict(precovered or {})
 
     recursive = getattr(settings, "recursive_scan", True)
     skip_samples = getattr(settings, "skip_sample_folders", True)
@@ -727,12 +799,15 @@ def _scan_one_tree(
     med_rt = median_runtime_minutes(episodes)
     singles: list[Path] = []
     megas: list[Path] = []
+    extra_paths: list[Path] = []
     for p in keep:
         dur = probe_duration_seconds(p)
         if getattr(settings, "detect_multi_episode", True) and is_multi_episode_candidate(
             dur, median_runtime_min=med_rt
         ):
             megas.append(p)
+        elif _is_likely_extra_path(p, duration_sec=dur, median_runtime_min=med_rt):
+            extra_paths.append(p)
         else:
             singles.append(p)
 
@@ -774,9 +849,14 @@ def _scan_one_tree(
         results.append(match)
         score_matrix.append(scores)
 
-    # Soft sequential prior from filename order on disc (D1, D2, …)
+    # Soft sequential prior over FREE episodes (skips already-covered codes)
     if singles and score_matrix:
-        score_matrix = apply_disc_order_prior(singles, score_matrix, episodes)
+        score_matrix = apply_disc_order_prior(
+            singles,
+            score_matrix,
+            episodes,
+            blocked=set(precovered.keys()),
+        )
 
     progress(ProgressEvent("plan", total_a, total_a, "Resolving unique assignments for singles…"))
     results = reassign_unique_episodes(
@@ -785,6 +865,7 @@ def _scan_one_tree(
         score_matrix=score_matrix,
         low_threshold=settings.low_threshold,
         auto_threshold=settings.auto_threshold,
+        blocked=set(precovered.keys()),
     )
     results = mark_content_duplicates(results)
     results = demote_duplicate_claims(results)
@@ -844,14 +925,14 @@ def _scan_one_tree(
         if row.error:
             row.selected = False
 
-    # Covered set from good single matches
-    covered: dict[tuple[int, int], str] = {}
+    # Covered set: prior discs/library + good singles from this disc
+    covered: dict[tuple[int, int], str] = dict(precovered)
     for row in plan:
         if row.season is None or row.episode is None:
             continue
         if row.error or row.confidence < settings.low_threshold:
             continue
-        if "content_duplicate" in row.flags:
+        if "content_duplicate" in row.flags or "likely_extra" in row.flags:
             continue
         covered[(row.season, row.episode)] = str(row.path)
 
@@ -863,6 +944,21 @@ def _scan_one_tree(
             lib_root = output_root / sanitize_filename(series.name)
         for k, v in scan_output_library_for_episodes(lib_root).items():
             covered.setdefault(k, v)
+
+    # Explicit EXTRA rows for likely non-episodes (not matched as show eps)
+    for ep_path in extra_paths:
+        plan.append(
+            RenamePlanRow(
+                path=ep_path,
+                original_name=ep_path.name,
+                selected=False,
+                error="likely_extra",
+                flags=["likely_extra"],
+                row_kind="rename",
+                proposed_name=ep_path.name,
+                confidence=0.0,
+            )
+        )
 
     # ----- Pass B: multi-episode inventory + gap-only splits -----
     split_rows: list[RenamePlanRow] = []

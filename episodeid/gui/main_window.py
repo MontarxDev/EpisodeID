@@ -51,20 +51,22 @@ from episodeid.renamer import (
     format_new_name,
     plan_summary_counts,
     season_dir_name,
+    source_folder_label,
     undo_last,
 )
 
 (
     COL_SEL,
     COL_STATUS,
+    COL_SOURCE,
     COL_ORIG,
     COL_CODE,
     COL_TITLE,
     COL_CONF,
     COL_NEW,
     COL_TARGET,
-) = range(8)
-_N_COLS = 8
+) = range(9)
+_N_COLS = 9
 
 
 class MainWindow(QMainWindow):
@@ -82,7 +84,7 @@ class MainWindow(QMainWindow):
         self._search_results: list[SeriesInfo] = []
         self._row_map: list[int] = []  # table row → plan index
         self._show_inventory_skips = False
-        self._show_extras = True
+        self._show_extras = False
 
         self._build_ui()
         self._apply_theme()
@@ -263,8 +265,11 @@ class MainWindow(QMainWindow):
         )
         self.show_skips_check.toggled.connect(self._on_show_skips_toggled)
         filter_row.addWidget(self.show_skips_check)
-        self.show_extras_check = QCheckBox("Show no-eng extras")
-        self.show_extras_check.setChecked(True)
+        self.show_extras_check = QCheckBox("Show extras")
+        self.show_extras_check.setChecked(False)
+        self.show_extras_check.setToolTip(
+            "Show non-episode extras (no English subs, commentary, short bonus tracks)"
+        )
         self.show_extras_check.toggled.connect(self._on_show_extras_toggled)
         filter_row.addWidget(self.show_extras_check)
         filter_row.addStretch()
@@ -276,6 +281,7 @@ class MainWindow(QMainWindow):
             [
                 "✓",
                 "Status",
+                "Source disc/folder",
                 "Original",
                 "SxxExx",
                 "Official Title",
@@ -289,6 +295,7 @@ class MainWindow(QMainWindow):
         self.table.horizontalHeader().setSectionResizeMode(COL_NEW, QHeaderView.Stretch)
         self.table.setColumnWidth(COL_SEL, 40)
         self.table.setColumnWidth(COL_STATUS, 78)
+        self.table.setColumnWidth(COL_SOURCE, 160)
         self.table.setColumnWidth(COL_CODE, 80)
         self.table.setColumnWidth(COL_CONF, 64)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -711,7 +718,10 @@ class MainWindow(QMainWindow):
         for i, row in enumerate(self.plan):
             kind = getattr(row, "row_kind", "rename")
             err = (row.error or "").lower()
-            is_extra = bool(err and ("no_english" in err or "no_subtitle" in err))
+            is_extra = bool(
+                "likely_extra" in (row.flags or [])
+                or (err and ("no_english" in err or "no_subtitle" in err or err == "likely_extra"))
+            )
 
             # Mega inventory skips hidden unless checkbox / Everything mode
             if kind == "inventory_skip":
@@ -764,20 +774,36 @@ class MainWindow(QMainWindow):
                 low_threshold=self.settings.low_threshold,
                 auto_threshold=self.settings.auto_threshold,
             )
-            # Friendlier labels for extras / skips
+            # Friendlier labels for extras / skips / dups
             err = (row.error or "").lower()
-            if "no_english" in err or "no_subtitle" in err:
+            if "likely_extra" in (row.flags or []) or "no_english" in err or err == "likely_extra":
                 status = "EXTRA"
+            elif "duplicate_global" in (row.flags or []):
+                status = "DUP"
             status_item = QTableWidgetItem(status)
             status_item.setFlags(status_item.flags() & ~Qt.ItemIsEditable)
             status_item.setTextAlignment(Qt.AlignCenter)
             self.table.setItem(row_idx, COL_STATUS, status_item)
 
+            # Source disc/folder for manual review (e.g. S1_D4)
+            src_label = source_folder_label(
+                row.path,
+                library_root=Path(self.folder_edit.text().strip() or ".")
+                if self.folder_edit.text().strip()
+                else None,
+            )
+            src_item = QTableWidgetItem(src_label)
+            src_item.setFlags(src_item.flags() & ~Qt.ItemIsEditable)
+            src_item.setToolTip(str(row.path))
+            self.table.setItem(row_idx, COL_SOURCE, src_item)
+
             display_name = row.original_name
             if status == "EXTRA":
-                display_name = f"{row.original_name}  (no English subtitles)"
+                display_name = f"{row.original_name}  (extra / not main episode)"
             elif getattr(row, "row_kind", "") == "inventory_skip":
                 display_name = f"{row.original_name}  — skipped (already on disc)"
+            elif status == "DUP":
+                display_name = f"{row.original_name}  (duplicate claim)"
             orig = QTableWidgetItem(display_name)
             orig.setFlags(orig.flags() & ~Qt.ItemIsEditable)
             self.table.setItem(row_idx, COL_ORIG, orig)

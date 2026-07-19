@@ -139,12 +139,11 @@ def load_settings(path: Path | None = None) -> Settings:
         data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             return Settings()
-        # Migrate: older installs / missing key → trust already-named (fast re-scan)
+        # Migrate: missing key → trust already-named (fast, avoids re-OCR)
         if "skip_already_named" not in data:
             data["skip_already_named"] = True
         # Prefer readable light UI when theme was system/dark-by-default on Mint
         if data.get("theme") in (None, "", "system"):
-            # Keep explicit "dark" if user chose it; only nudge system → light
             if data.get("theme") != "dark":
                 data["theme"] = "light"
         return Settings.from_dict(data)
