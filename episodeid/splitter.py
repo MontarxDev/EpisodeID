@@ -11,9 +11,12 @@ from pathlib import Path
 
 from episodeid.deps import which
 from episodeid.extractor import probe_duration_seconds, run_cmd, sample_dialogue
-from episodeid.matcher import match_dialogue
+from episodeid.matcher import match_dialogue, score_all_episodes
 from episodeid.models import Episode, MatchResult
 from episodeid.renamer import format_new_name, resolve_target_dir, sanitize_filename
+
+# Require this much more confidence before escalation may change episode identity
+ESCALATE_IDENTITY_MARGIN = 8.0
 
 
 @dataclass
@@ -307,6 +310,7 @@ def identify_segment(
     all_lines: list[str] = []
     seen: set[str] = set()
     best_match: MatchResult | None = None
+    first_match: MatchResult | None = None
     best_quality = 0.0
     last_error: str | None = None
     samples_taken = 0
@@ -319,6 +323,27 @@ def identify_segment(
                 continue
             seen.add(key)
             all_lines.append(ln)
+
+    def _code(m: MatchResult | None) -> tuple[int, int] | None:
+        if m is None or m.season is None or m.episode is None:
+            return None
+        return (int(m.season), int(m.episode))
+
+    def _prefer_match(current: MatchResult | None, candidate: MatchResult) -> MatchResult:
+        """Higher conf wins, but do not flip identity without a clear margin over first pass."""
+        if current is None:
+            return candidate
+        if candidate.confidence <= current.confidence:
+            return current
+        # Allow conf improvement for the *same* episode always
+        if _code(candidate) == _code(current) or _code(candidate) == _code(first_match):
+            return candidate
+        # Identity change: require clear margin vs first-pass pick
+        anchor = first_match or current
+        if _code(candidate) != _code(anchor):
+            if candidate.confidence < (anchor.confidence + ESCALATE_IDENTITY_MARGIN):
+                return current
+        return candidate
 
     for wi, (offset_min, scan_min) in enumerate(windows):
         if wi > 0:
@@ -361,12 +386,19 @@ def identify_segment(
             sample_quality=sample.quality,
             track_info=sample.track_info,
         )
-        if best_match is None or match.confidence > best_match.confidence:
-            best_match = match
+        if first_match is None:
+            first_match = match
+        best_match = _prefer_match(best_match, match)
 
-        # Stop early if already strong enough
-        if match.confidence >= escalate_below:
+        # Stop early if already strong enough on first-pass identity
+        if match.confidence >= escalate_below and (
+            first_match is None or _code(match) == _code(first_match)
+        ):
             break
+        if match.confidence >= escalate_below and first_match and _code(match) != _code(first_match):
+            # Strong alternate — only stop if margin is clear
+            if match.confidence >= first_match.confidence + ESCALATE_IDENTITY_MARGIN:
+                break
         if not escalate_enabled:
             break
         # Hard permanent errors: no more windows help
@@ -380,7 +412,7 @@ def identify_segment(
             segment.flags = list(segment.flags) + ["escalated_sample"]
         return segment
 
-    # Merged re-score (can beat any single window)
+    # Merged re-score — can raise conf, but identity flip needs margin
     if len(all_lines) >= 3:
         from episodeid.textutil import join_dialogue
 
@@ -396,10 +428,25 @@ def identify_segment(
             sample_quality=best_quality,
             track_info=f"merged {samples_taken} window(s)",
         )
-        if best_match is None or merged.confidence > best_match.confidence:
+        best_match = _prefer_match(best_match, merged)
+        # If first-pass identity kept, still adopt higher conf from same-code merged scores
+        if (
+            first_match
+            and best_match
+            and _code(best_match) == _code(first_match)
+            and merged.confidence > best_match.confidence
+            and _code(merged) == _code(first_match)
+        ):
             best_match = merged
 
     assert best_match is not None
+    # Final safety: never silently abandon first-pass without margin
+    if first_match and _code(best_match) != _code(first_match):
+        if best_match.confidence < first_match.confidence + ESCALATE_IDENTITY_MARGIN:
+            best_match = first_match
+            if escalated and "escalate_kept_first" not in (best_match.flags or []):
+                pass  # flag added below
+
     segment.season = best_match.season
     segment.episode = best_match.episode
     segment.title = best_match.title or ""
@@ -413,6 +460,9 @@ def identify_segment(
     if escalated:
         if "escalated_sample" not in flags:
             flags.append("escalated_sample")
+        if first_match and _code(best_match) == _code(first_match):
+            if "escalate_kept_first" not in flags:
+                flags.append("escalate_kept_first")
         if (
             best_match.season is not None
             and best_match.confidence >= escalate_below
@@ -421,6 +471,134 @@ def identify_segment(
             flags.append("escalate_improved")
     segment.flags = flags
     return segment
+
+
+def reassign_segments_unique(
+    segments: list[SplitSegment],
+    episodes: list[Episode],
+    *,
+    covered: dict[tuple[int, int], str] | None = None,
+    season_locked: bool = False,
+    order_boost: float = 14.0,
+    low_threshold: float = 55.0,
+    auto_threshold: float = 70.0,
+) -> list[SplitSegment]:
+    """Unique SxxExx assignment across segments of one multi-ep file.
+
+    When season-locked (e.g. S7 disc), soft-prior segment order → episode order
+    so mid-arc Bad Batch eps (E02 vs E03) do not both claim E03.
+    """
+    if not segments or not episodes:
+        return segments
+
+    covered = covered or {}
+    blocked = set(covered.keys())
+
+    # Score each segment against catalog
+    score_matrix: list[list[float]] = []
+    for seg in segments:
+        if seg.skip or seg.error in {"no_english_subtitles", "no_subtitle_tracks"}:
+            score_matrix.append([0.0] * len(episodes))
+            continue
+        text = " ".join(seg.dialogue_lines or [])
+        if not text.strip():
+            score_matrix.append([0.0] * len(episodes))
+            continue
+        scores = score_all_episodes(
+            text,
+            episodes,
+            lines=list(seg.dialogue_lines),
+            sample_quality=seg.sample_quality or 70.0,
+        )
+        score_matrix.append(list(scores))
+
+    # Order prior among episodes that already look plausible for *this* mega
+    # (avoids S7_D2 being forced onto E01–E03 just because they are first in season)
+    ep_order = sorted(
+        range(len(episodes)),
+        key=lambda j: (episodes[j].season, episodes[j].episode),
+    )
+    plausible: set[int] = set()
+    for i, row in enumerate(score_matrix):
+        if segments[i].skip:
+            continue
+        ranked_j = sorted(range(len(row)), key=lambda j: row[j], reverse=True)
+        for j in ranked_j[:6]:
+            if row[j] >= max(25.0, low_threshold * 0.4):
+                key = (episodes[j].season, episodes[j].episode)
+                if key not in blocked:
+                    plausible.add(j)
+    free_order = [j for j in ep_order if j in plausible]
+    # If too few plausible, fall back to all free season eps
+    if len(free_order) < len([s for s in segments if not s.skip]):
+        free_order = [
+            j
+            for j in ep_order
+            if (episodes[j].season, episodes[j].episode) not in blocked
+        ]
+
+    active_idx = [i for i, s in enumerate(segments) if not s.skip]
+    if free_order and order_boost > 0:
+        for rank, si in enumerate(active_idx):
+            if rank < len(free_order):
+                j = free_order[rank]
+                score_matrix[si][j] = float(score_matrix[si][j]) + order_boost
+                if rank > 0:
+                    score_matrix[si][free_order[rank - 1]] += order_boost * 0.25
+                if rank + 1 < len(free_order):
+                    score_matrix[si][free_order[rank + 1]] += order_boost * 0.25
+
+    # Greedy unique assignment
+    pairs: list[tuple[float, int, int]] = []
+    for i, row in enumerate(score_matrix):
+        if segments[i].skip:
+            continue
+        for j, sc in enumerate(row):
+            key = (episodes[j].season, episodes[j].episode)
+            if key in blocked:
+                continue
+            if sc >= max(20.0, low_threshold * 0.35):
+                pairs.append((sc, i, j))
+    pairs.sort(reverse=True, key=lambda x: x[0])
+
+    used_seg: set[int] = set()
+    used_ep: set[int] = set()
+    assignment: dict[int, tuple[int, float]] = {}
+    for sc, i, j in pairs:
+        if i in used_seg or j in used_ep:
+            continue
+        used_seg.add(i)
+        used_ep.add(j)
+        assignment[i] = (j, sc)
+
+    for i, seg in enumerate(segments):
+        if i not in assignment:
+            continue
+        j, sc = assignment[i]
+        ep = episodes[j]
+        prev = (seg.season, seg.episode)
+        seg.season = ep.season
+        seg.episode = ep.episode
+        seg.title = ep.title
+        seg.confidence = round(float(sc), 1)
+        seg.error = None
+        flags = [f for f in seg.flags if f not in {"duplicate_global", "duplicate_claim", "no_match"}]
+        if "assigned_unique_segment" not in flags:
+            flags.append("assigned_unique_segment")
+        if prev != (ep.season, ep.episode) and "order_reassigned" not in flags:
+            if season_locked:
+                flags.append("order_reassigned")
+        if sc >= auto_threshold:
+            flags = [f for f in flags if f not in {"review", "low_confidence"}]
+        elif sc >= low_threshold:
+            if "review" not in flags:
+                flags.append("review")
+        else:
+            if "low_confidence" not in flags:
+                flags.append("low_confidence")
+        seg.flags = flags
+
+    return segments
 
 
 def apply_covered_filter(

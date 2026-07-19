@@ -28,6 +28,7 @@ from episodeid.splitter import (
     inventory_segments,
     is_multi_episode_candidate,
     median_runtime_minutes,
+    reassign_segments_unique,
     scan_output_library_for_episodes,
 )
 from episodeid.llm import identify_with_llm
@@ -973,6 +974,26 @@ def _scan_one_tree(
                     max_extra_samples=int(getattr(settings, "max_extra_samples", 2) or 0),
                     progress=_seg_prog,
                 )
+            # Unique SxxExx across this mega + sequential prior when season-locked
+            # (prevents mid-arc eps both claiming e.g. S07E03 after escalate)
+            progress(
+                ProgressEvent(
+                    "plan",
+                    0,
+                    1,
+                    f"Unique segment assignment for {mpath.name}"
+                    + (" (season order prior)" if season_locked else ""),
+                )
+            )
+            segs = reassign_segments_unique(
+                segs,
+                episodes,
+                covered=covered,
+                season_locked=season_locked,
+                order_boost=14.0 if season_locked else 6.0,
+                low_threshold=settings.low_threshold,
+                auto_threshold=settings.auto_threshold,
+            )
             segs = apply_covered_filter(segs, covered, skip_if_covered=skip_covered)
 
             for seg in segs:

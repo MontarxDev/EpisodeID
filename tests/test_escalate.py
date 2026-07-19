@@ -136,3 +136,101 @@ def test_identify_no_escalate_when_disabled():
             max_extra_samples=2,
         )
     assert calls["n"] == 1
+
+
+def test_escalate_keeps_first_when_merge_within_margin():
+    from episodeid.models import MatchResult
+
+    seg = SplitSegment(Path("mega.mkv"), 0.0, 1800.0)
+
+    def fake_sample(*_a, **_k):
+        return _sample(["dialogue about Purkoll prisoner"], quality=90)
+
+    # first 70 E02; escalate/merge 76 E03 — delta 6 < margin 8 → keep E02
+    seq = [
+        MatchResult(Path("m"), season=7, episode=2, title="A Distant Echo", confidence=70.0),
+        MatchResult(Path("m"), season=7, episode=3, title="Keeradaks", confidence=75.0),
+        MatchResult(Path("m"), season=7, episode=3, title="Keeradaks", confidence=76.0),
+        MatchResult(Path("m"), season=7, episode=3, title="Keeradaks", confidence=76.5),
+    ]
+    mi = {"i": 0}
+
+    def fake_match(*_a, **_k):
+        i = mi["i"]
+        mi["i"] += 1
+        return seq[min(i, len(seq) - 1)]
+
+    with (
+        patch("episodeid.splitter.sample_dialogue", side_effect=fake_sample),
+        patch("episodeid.splitter.match_dialogue", side_effect=fake_match),
+    ):
+        identify_segment(
+            seg,
+            _eps(),
+            escalate_enabled=True,
+            escalate_below=80.0,
+            max_extra_samples=2,
+        )
+    assert seg.episode == 2
+    assert "escalate_kept_first" in seg.flags
+
+
+def test_reassign_segments_unique_fixes_duplicate_e03():
+    from episodeid.splitter import reassign_segments_unique
+
+    segs = [
+        SplitSegment(
+            Path("m.mkv"),
+            0,
+            1800,
+            season=7,
+            episode=1,
+            title="The Bad Batch",
+            confidence=93,
+            dialogue_lines=["Wrecker Yalbec Queen Bad Batch defective clones"],
+            sample_quality=90,
+        ),
+        SplitSegment(
+            Path("m.mkv"),
+            1800,
+            3600,
+            season=7,
+            episode=3,  # wrong — should be E02
+            title="Keeradaks",
+            confidence=80,
+            dialogue_lines=[
+                "Purkoll prisoner communication problem",
+                "Tech open this door infiltrate Purkoll",
+                "we will leave his planet for good",
+            ],
+            sample_quality=90,
+        ),
+        SplitSegment(
+            Path("m.mkv"),
+            3600,
+            5400,
+            season=7,
+            episode=3,
+            title="Keeradaks",
+            confidence=92,
+            dialogue_lines=[
+                "Techno Union Skako Minor profit margin",
+                "Jedi will always have an ally",
+            ],
+            sample_quality=90,
+        ),
+    ]
+    out = reassign_segments_unique(
+        segs,
+        _eps(),
+        season_locked=True,
+        order_boost=14.0,
+        low_threshold=55.0,
+        auto_threshold=70.0,
+    )
+    codes = [(s.season, s.episode) for s in out]
+    assert codes[0] == (7, 1)
+    assert codes[1] == (7, 2), f"middle should be E02, got {codes[1]}"
+    assert codes[2] == (7, 3)
+    # unique
+    assert len(set(codes)) == 3
