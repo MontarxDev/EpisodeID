@@ -116,6 +116,10 @@ class Settings:
     # Full-library helpers
     auto_season_from_folder: bool = True
     disc_by_disc_scan: bool = True  # when root has multiple disc folders
+    # Escalating multi-sample: first short pass, then extra windows if conf low
+    escalate_enabled: bool = True
+    escalate_below: float = 80.0  # re-sample when confidence is below this
+    max_extra_samples: int = 2  # extra windows after the first (3 total)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

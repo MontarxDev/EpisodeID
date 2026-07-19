@@ -218,6 +218,11 @@ class MainWindow(QMainWindow):
         root.addWidget(self.progress)
         self.progress_label = QLabel("Ready")
         root.addWidget(self.progress_label)
+        self.coverage_label = QLabel("")
+        self.coverage_label.setWordWrap(True)
+        self.coverage_label.setStyleSheet("font-weight: 600;")
+        self.coverage_label.hide()
+        root.addWidget(self.coverage_label)
 
         # Result filters (so S7 splits / problems are findable)
         filter_row = QHBoxLayout()
@@ -515,13 +520,68 @@ class MainWindow(QMainWindow):
             f"{counts['inventory_skip']} mega-skipped · {counts['extra']} no-eng extras · "
             f"{counts['review']} need review"
         )
+        cov_text = self._coverage_text()
+        if cov_text:
+            self.coverage_label.setText(f"Season coverage: {cov_text}")
+            self.coverage_label.setToolTip(cov_text)
+            self.coverage_label.show()
+        else:
+            self.coverage_label.hide()
         season_badge = self._season_badge_text()
         self.progress_label.setText(f"Done — {summary}.{log_hint}")
         if season_badge:
             self.progress_label.setText(
                 self.progress_label.text() + f"  |  {season_badge}"
             )
-        self.statusBar().showMessage(f"Scan complete: {summary}{log_hint}")
+        bar = f"Scan complete: {summary}"
+        if cov_text:
+            bar += f"  |  {cov_text}"
+        self.statusBar().showMessage(bar + log_hint)
+
+    def _coverage_text(self) -> str:
+        """Missing/found episodes per season from plan + full catalog."""
+        from episodeid.coverage import format_coverage_summary, season_coverage
+
+        if not self.plan:
+            return ""
+        catalog = list(self.episodes or [])
+        if not catalog:
+            # Fall back to seasons only from plan (no totals)
+            return self._season_badge_text()
+        # Prefer summary stored on session log if present
+        if self._session_log:
+            try:
+                import json
+
+                sj = self._session_log.summary_json
+                if sj.exists():
+                    data = json.loads(sj.read_text(encoding="utf-8"))
+                    extra = data.get("extra") or {}
+                    if extra.get("coverage_summary"):
+                        return str(extra["coverage_summary"])
+                    if extra.get("coverage"):
+                        # rebuild short string from stored dicts
+                        from episodeid.coverage import SeasonCoverage
+
+                        covs = [
+                            SeasonCoverage(
+                                season=int(c["season"]),
+                                total=int(c["total"]),
+                                found=int(c["found"]),
+                                found_codes=list(c.get("found_codes") or []),
+                                missing_codes=list(c.get("missing_codes") or []),
+                            )
+                            for c in extra["coverage"]
+                        ]
+                        return format_coverage_summary(covs)
+            except Exception:
+                pass
+        cov = season_coverage(
+            self.plan,
+            catalog,
+            low_threshold=self.settings.low_threshold,
+        )
+        return format_coverage_summary(cov)
 
     def _season_badge_text(self) -> str:
         """Highlight seasons that only appear as splits (e.g. S07)."""

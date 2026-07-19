@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -255,55 +256,170 @@ def inventory_segments(
     ]
 
 
+def _segment_sample_windows(
+    segment: SplitSegment,
+    *,
+    n_windows: int = 3,
+) -> list[tuple[float, float]]:
+    """Return list of (offset_min, scan_min) inside the segment.
+
+    Pass 1 ~12%, pass 2 ~45%, pass 3 ~70% into the segment.
+    """
+    duration_min = max(0.5, (segment.end - segment.start) / 60.0)
+    seg_start = segment.start / 60.0
+    seg_end = segment.end / 60.0
+    scan_min = min(6.0, max(2.0, duration_min * 0.28))
+    fracs = [0.12, 0.45, 0.70][: max(1, n_windows)]
+    windows: list[tuple[float, float]] = []
+    for frac in fracs:
+        offset = seg_start + duration_min * frac
+        this_scan = scan_min
+        if offset + this_scan > seg_end:
+            this_scan = max(1.0, seg_end - offset - 0.05)
+        if this_scan < 0.8:
+            continue
+        # keep window fully inside segment
+        if offset < seg_start:
+            offset = seg_start
+        windows.append((offset, this_scan))
+    return windows or [(seg_start + duration_min * 0.12, min(4.0, duration_min * 0.4))]
+
+
 def identify_segment(
     segment: SplitSegment,
     episodes: list[Episode],
     *,
     low_threshold: float = 55.0,
     auto_threshold: float = 70.0,
+    escalate_enabled: bool = True,
+    escalate_below: float = 80.0,
+    max_extra_samples: int = 2,
+    progress: Callable[[str], None] | None = None,
 ) -> SplitSegment:
-    """Sample dialogue inside segment window and match."""
-    duration_min = max(0.5, (segment.end - segment.start) / 60.0)
-    # Sample from ~15% into segment for a few minutes
-    offset_min = segment.start / 60.0 + duration_min * 0.12
-    scan_min = min(6.0, max(2.0, duration_min * 0.35))
-    # Clamp inside segment
-    seg_end_min = segment.end / 60.0
-    if offset_min + scan_min > seg_end_min:
-        scan_min = max(1.0, seg_end_min - offset_min - 0.05)
+    """Sample dialogue inside segment window and match.
 
-    sample = sample_dialogue(
-        segment.source,
-        offset_minutes=offset_min,
-        scan_duration_minutes=scan_min,
-        max_lines=35,
-        prefer_english=True,
-        adaptive=False,
-    )
-    segment.dialogue_lines = list(sample.lines)
-    segment.sample_quality = sample.quality
-    if sample.is_empty() or sample.quality < 30:
-        segment.error = sample.error or "poor_ocr"
+    Fast first pass; if confidence is below ``escalate_below``, sample more
+    windows inside the same segment and re-match (merged + best window).
+    """
+    n_total = 1 + (max(0, int(max_extra_samples)) if escalate_enabled else 0)
+    windows = _segment_sample_windows(segment, n_windows=n_total)
+
+    all_lines: list[str] = []
+    seen: set[str] = set()
+    best_match: MatchResult | None = None
+    best_quality = 0.0
+    last_error: str | None = None
+    samples_taken = 0
+    escalated = False
+
+    def _add_lines(lines: list[str]) -> None:
+        for ln in lines:
+            key = (ln or "").strip().casefold()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            all_lines.append(ln)
+
+    for wi, (offset_min, scan_min) in enumerate(windows):
+        if wi > 0:
+            escalated = True
+            if progress:
+                progress(
+                    f"extra sample {wi}/{len(windows) - 1} "
+                    f"@ {offset_min:.1f}m ({scan_min:.1f}m window)"
+                )
+
+        sample = sample_dialogue(
+            segment.source,
+            offset_minutes=offset_min,
+            scan_duration_minutes=scan_min,
+            max_lines=35,
+            prefer_english=True,
+            adaptive=False,
+        )
+        samples_taken += 1
+        if sample.is_empty() or sample.quality < 30:
+            last_error = sample.error or "poor_ocr"
+            # First pass hard-empty: still try next window if escalate on
+            if wi == 0 and not escalate_enabled:
+                segment.error = last_error
+                segment.confidence = 0.0
+                return segment
+            continue
+
+        _add_lines(list(sample.lines))
+        best_quality = max(best_quality, sample.quality)
+
+        match = match_dialogue(
+            sample.raw_text,
+            episodes,
+            path=segment.source,
+            dialogue_source=sample.source,
+            low_threshold=low_threshold,
+            auto_threshold=auto_threshold,
+            lines=sample.lines,
+            sample_quality=sample.quality,
+            track_info=sample.track_info,
+        )
+        if best_match is None or match.confidence > best_match.confidence:
+            best_match = match
+
+        # Stop early if already strong enough
+        if match.confidence >= escalate_below:
+            break
+        if not escalate_enabled:
+            break
+        # Hard permanent errors: no more windows help
+        if match.error in {"no_english_subtitles", "no_subtitle_tracks"}:
+            break
+
+    if not all_lines and best_match is None:
+        segment.error = last_error or "no_dialogue_extracted"
         segment.confidence = 0.0
+        if escalated:
+            segment.flags = list(segment.flags) + ["escalated_sample"]
         return segment
 
-    match = match_dialogue(
-        sample.raw_text,
-        episodes,
-        path=segment.source,
-        dialogue_source=sample.source,
-        low_threshold=low_threshold,
-        auto_threshold=auto_threshold,
-        lines=sample.lines,
-        sample_quality=sample.quality,
-        track_info=sample.track_info,
+    # Merged re-score (can beat any single window)
+    if len(all_lines) >= 3:
+        from episodeid.textutil import join_dialogue
+
+        merged_text = join_dialogue(all_lines)
+        merged = match_dialogue(
+            merged_text,
+            episodes,
+            path=segment.source,
+            dialogue_source="segment_ocr_merged",
+            low_threshold=low_threshold,
+            auto_threshold=auto_threshold,
+            lines=all_lines[:50],
+            sample_quality=best_quality,
+            track_info=f"merged {samples_taken} window(s)",
+        )
+        if best_match is None or merged.confidence > best_match.confidence:
+            best_match = merged
+
+    assert best_match is not None
+    segment.season = best_match.season
+    segment.episode = best_match.episode
+    segment.title = best_match.title or ""
+    segment.confidence = best_match.confidence
+    segment.error = best_match.error
+    segment.dialogue_lines = (
+        list(all_lines[:40]) if all_lines else list(best_match.dialogue_lines or [])
     )
-    segment.season = match.season
-    segment.episode = match.episode
-    segment.title = match.title or ""
-    segment.confidence = match.confidence
-    segment.error = match.error
-    segment.flags = list(match.flags)
+    segment.sample_quality = best_quality or best_match.sample_quality
+    flags = list(best_match.flags)
+    if escalated:
+        if "escalated_sample" not in flags:
+            flags.append("escalated_sample")
+        if (
+            best_match.season is not None
+            and best_match.confidence >= escalate_below
+            and "escalate_improved" not in flags
+        ):
+            flags.append("escalate_improved")
+    segment.flags = flags
     return segment
 
 

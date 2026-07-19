@@ -224,6 +224,36 @@ def _render_markdown(payload: dict[str, Any]) -> str:
         f"| Low confidence | {c.get('low_confidence', 0)} |",
         f"| Review flags | {c.get('review_flags', 0)} |",
         "",
+    ]
+
+    extra = payload.get("extra") or {}
+    coverage = extra.get("coverage") or []
+    if coverage:
+        lines += [
+            "## Season coverage",
+            "",
+            "| Season | Found | Total | Status | Missing |",
+            "|--------|------:|------:|--------|---------|",
+        ]
+        for cov in coverage:
+            season = int(cov.get("season") or 0)
+            found = int(cov.get("found") or 0)
+            total = int(cov.get("total") or 0)
+            complete = cov.get("complete")
+            missing = cov.get("missing_codes") or []
+            miss_s = ", ".join(missing[:12])
+            if len(missing) > 12:
+                miss_s += f" +{len(missing) - 12}"
+            status = "complete" if complete else "incomplete"
+            lines.append(
+                f"| S{season:02d} | {found} | {total} | {status} | {miss_s or '—'} |"
+            )
+        lines.append("")
+        if extra.get("coverage_summary"):
+            lines.append(f"_Summary: {extra['coverage_summary']}_")
+            lines.append("")
+
+    lines += [
         "## Rows needing attention",
         "",
     ]

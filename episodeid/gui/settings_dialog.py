@@ -216,8 +216,28 @@ class SettingsDialog(QDialog):
             getattr(self.settings, "skip_split_if_in_output_library", True)
         )
 
+        self.escalate_enabled = QCheckBox(
+            "Take extra dialogue samples when confidence is low (faster overall)"
+        )
+        self.escalate_enabled.setChecked(getattr(self.settings, "escalate_enabled", True))
+        self.escalate_enabled.setToolTip(
+            "First pass uses a short sample. Below the escalate threshold, "
+            "more windows are OCR'd only for that file/segment."
+        )
+        self.escalate_below = QDoubleSpinBox()
+        self.escalate_below.setRange(40, 100)
+        self.escalate_below.setValue(float(getattr(self.settings, "escalate_below", 80.0)))
+        self.escalate_below.setSuffix(" %")
+        self.max_extra_samples = QSpinBox()
+        self.max_extra_samples.setRange(0, 4)
+        self.max_extra_samples.setValue(int(getattr(self.settings, "max_extra_samples", 2)))
+        self.max_extra_samples.setToolTip("Extra sample windows after the first (0 = never escalate)")
+
         form.addRow("Low confidence threshold", self.low_threshold)
         form.addRow("High confidence threshold", self.auto_threshold)
+        form.addRow(self.escalate_enabled)
+        form.addRow("Escalate below confidence", self.escalate_below)
+        form.addRow("Max extra samples", self.max_extra_samples)
         form.addRow("Subtitle sample offset", self.offset)
         form.addRow("Subtitle scan duration", self.duration)
         form.addRow("Max dialogue lines", self.max_lines)
@@ -402,6 +422,9 @@ class SettingsDialog(QDialog):
         self.settings.skip_split_if_in_output_library = self.skip_split_output.isChecked()
         self.settings.low_threshold = float(self.low_threshold.value())
         self.settings.auto_threshold = float(self.auto_threshold.value())
+        self.settings.escalate_enabled = self.escalate_enabled.isChecked()
+        self.settings.escalate_below = float(self.escalate_below.value())
+        self.settings.max_extra_samples = int(self.max_extra_samples.value())
         self.settings.offset_minutes = float(self.offset.value())
         self.settings.scan_duration_minutes = float(self.duration.value())
         self.settings.max_lines = int(self.max_lines.value())

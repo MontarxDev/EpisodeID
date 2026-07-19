@@ -40,6 +40,11 @@ from episodeid.matcher import (
 from episodeid.metadata import TMDBClient
 from episodeid.models import Episode, MatchResult, ProgressEvent, RenamePlanRow, SeriesInfo
 from episodeid.refsubs import attach_reference_subs
+from episodeid.coverage import (
+    format_coverage_summary,
+    season_coverage,
+    seasons_touched_by_plan,
+)
 from episodeid.renamer import (
     apply_disc_order_prior,
     build_plan,
@@ -68,6 +73,48 @@ def _resolve_output_root(scan_folder: Path, settings: Settings) -> Path:
     if out:
         return Path(out)
     return scan_folder
+
+
+def _compute_coverage(
+    plan: list[RenamePlanRow],
+    catalog: list[Episode],
+    *,
+    settings: Settings,
+    series: SeriesInfo,
+    output_root: Path,
+) -> tuple[list, str, list[dict]]:
+    """Return (SeasonCoverage list, summary string, dicts for JSON)."""
+    also: dict[tuple[int, int], str] = {}
+    if getattr(settings, "skip_split_if_in_output_library", True):
+        lib_root = output_root
+        if getattr(settings, "output_create_series_subfolder", True):
+            from episodeid.renamer import sanitize_filename
+
+            lib_root = output_root / sanitize_filename(series.name)
+        also = scan_output_library_for_episodes(lib_root)
+
+    # Report seasons touched by plan, else all catalog seasons
+    touched = seasons_touched_by_plan(plan)
+    seasons = touched if touched else None
+    cov = season_coverage(
+        plan,
+        catalog,
+        low_threshold=settings.low_threshold,
+        also_covered=also or None,
+        seasons=seasons,
+    )
+    # If scan was season-scoped (one season), only that season is enough;
+    # if full library, show all incomplete catalog seasons with any touch + incomplete ones
+    if not touched and catalog:
+        cov = season_coverage(
+            plan,
+            catalog,
+            low_threshold=settings.low_threshold,
+            also_covered=also or None,
+            seasons=None,
+        )
+    summary = format_coverage_summary(cov)
+    return cov, summary, [c.to_dict() for c in cov]
 
 
 def _write_scan_log(plan: list[RenamePlanRow], series: SeriesInfo, folder: Path) -> Path | None:
@@ -152,11 +199,12 @@ def _process_one_file(
     )
     duration = sample.duration_sec or probe_duration_seconds(path)
 
-    if sample.is_empty() or sample.error in {
+    hard_empty = sample.error in {
         "no_english_subtitles",
         "no_subtitle_tracks",
         "no_dialogue_extracted",
-    }:
+    }
+    if sample.is_empty() or hard_empty:
         result = MatchResult(
             path=path,
             error=sample.error or sample.track_info or "No dialogue extracted",
@@ -169,51 +217,115 @@ def _process_one_file(
         result = apply_file_flags(result, duration_sec=duration, path=path)
         return result, [0.0] * len(episodes)
 
-    raw_scores = score_all_episodes(
-        sample.raw_text,
-        episodes,
-        lines=sample.lines,
-        sample_quality=sample.quality,
-    )
-    # Soft boost when nested under Season XX
-    scores = [
-        season_path_boost(path, ep.season, sc)
-        for sc, ep in zip(raw_scores, episodes)
-    ]
+    # Collect samples (pass 1 + optional escalate windows)
+    all_lines: list[str] = list(sample.lines or [])
+    seen = {(ln or "").strip().casefold() for ln in all_lines if (ln or "").strip()}
+    best_quality = float(sample.quality or 0)
+    escalated = False
+    escalate_on = getattr(settings, "escalate_enabled", True)
+    escalate_below = float(getattr(settings, "escalate_below", 80.0))
+    max_extra = int(getattr(settings, "max_extra_samples", 2) or 0)
 
-    match = match_dialogue(
-        sample.raw_text,
-        episodes,
-        path=path,
-        dialogue_source=sample.source,
-        low_threshold=settings.low_threshold,
-        auto_threshold=settings.auto_threshold,
-        lines=sample.lines,
-        sample_quality=sample.quality,
-        track_info=sample.track_info,
-    )
-    # Prefer path-boosted ranking for primary pick when close
-    if scores:
-        best_j = max(range(len(scores)), key=lambda j: scores[j])
-        if scores[best_j] >= match.confidence - 5 or match.error:
-            ep = episodes[best_j]
-            match.season = ep.season
-            match.episode = ep.episode
-            match.title = ep.title
-            match.confidence = round(scores[best_j], 1)
-            match.low_confidence = match.confidence < settings.low_threshold
-            match.error = None
+    def _score_text(text: str, lines: list[str], quality: float) -> tuple[MatchResult, list[float]]:
+        raw = score_all_episodes(
+            text, episodes, lines=lines, sample_quality=quality
+        )
+        boosted = [
+            season_path_boost(path, ep.season, sc) for sc, ep in zip(raw, episodes)
+        ]
+        m = match_dialogue(
+            text,
+            episodes,
+            path=path,
+            dialogue_source=sample.source,
+            low_threshold=settings.low_threshold,
+            auto_threshold=settings.auto_threshold,
+            lines=lines,
+            sample_quality=quality,
+            track_info=sample.track_info,
+        )
+        if boosted:
+            best_j = max(range(len(boosted)), key=lambda j: boosted[j])
+            if boosted[best_j] >= m.confidence - 5 or m.error:
+                ep = episodes[best_j]
+                m.season = ep.season
+                m.episode = ep.episode
+                m.title = ep.title
+                m.confidence = round(boosted[best_j], 1)
+                m.low_confidence = m.confidence < settings.low_threshold
+                m.error = None
+        return m, boosted
+
+    match, scores = _score_text(sample.raw_text, list(sample.lines), sample.quality)
+
+    # Escalate: extra mid/late windows when first pass is weak
+    if (
+        escalate_on
+        and max_extra > 0
+        and match.confidence < escalate_below
+        and duration > 600
+        and match.error not in {"no_english_subtitles", "no_subtitle_tracks"}
+    ):
+        fracs = [0.45, 0.70][:max_extra]
+        scan_min = min(
+            float(settings.scan_duration_minutes or 6),
+            max(2.0, (duration / 60.0) * 0.15),
+        )
+        for frac in fracs:
+            if match.confidence >= escalate_below:
+                break
+            off = (duration / 60.0) * frac
+            if off + scan_min > duration / 60.0:
+                continue
+            escalated = True
+            extra = sample_dialogue(
+                path,
+                offset_minutes=off,
+                scan_duration_minutes=scan_min,
+                max_lines=settings.max_lines,
+                prefer_english=True,
+                adaptive=False,
+            )
+            if extra.is_empty() or extra.quality < 30:
+                continue
+            best_quality = max(best_quality, extra.quality)
+            for ln in extra.lines or []:
+                key = (ln or "").strip().casefold()
+                if key and key not in seen:
+                    seen.add(key)
+                    all_lines.append(ln)
+            m2, s2 = _score_text(extra.raw_text, list(extra.lines), extra.quality)
+            if m2.confidence > match.confidence:
+                match, scores = m2, s2
+
+        # Merged re-score
+        if len(all_lines) >= 3:
+            from episodeid.textutil import join_dialogue
+
+            merged_text = join_dialogue(all_lines)
+            m3, s3 = _score_text(merged_text, all_lines[:50], best_quality)
+            if m3.confidence > match.confidence:
+                match, scores = m3, s3
+            match.dialogue_lines = list(all_lines[:40])
+            match.sample_quality = best_quality
+            match.dialogue_source = "merged_escalate"
+        if escalated:
+            if "escalated_sample" not in match.flags:
+                match.flags.append("escalated_sample")
+            if match.confidence >= escalate_below and "escalate_improved" not in match.flags:
+                match.flags.append("escalate_improved")
 
     if (
         settings.llm_enabled
-        and sample.quality >= 35
+        and best_quality >= 35
         and (not settings.llm_only_when_low or match.low_confidence or match.error)
     ):
         api = get_secret(KEY_GEMINI) if settings.llm_provider == "gemini" else None
         llm_match = identify_with_llm(
             provider=settings.llm_provider,
             series_name=series.name,
-            dialogue=sample.raw_text,
+            dialogue=match.dialogue_lines and " ".join(match.dialogue_lines)
+            or sample.raw_text,
             episodes=episodes,
             api_key=api,
             model=settings.llm_model,
@@ -223,8 +335,8 @@ def _process_one_file(
         if not llm_match.error and llm_match.season is not None:
             if match.low_confidence or match.error or llm_match.confidence >= match.confidence:
                 llm_match.dialogue_source = sample.source
-                llm_match.dialogue_lines = list(sample.lines)
-                llm_match.sample_quality = sample.quality
+                llm_match.dialogue_lines = list(match.dialogue_lines or sample.lines)
+                llm_match.sample_quality = best_quality or sample.quality
                 llm_match.track_info = sample.track_info
                 if "llm" not in llm_match.flags:
                     llm_match.flags.append("llm")
@@ -424,16 +536,21 @@ def scan_and_identify(
         )
         combined = finalize_plan_rows(combined)
         counts = plan_summary_counts(combined)
-        _progress(
-            ProgressEvent(
-                "done",
-                len(discs),
-                len(discs),
-                f"All discs done — {counts['rename']} rename · {counts['split']} split · "
-                f"{counts['inventory_skip']} mega-skipped · {counts['extra']} no-eng extras "
-                f"({len(combined)} rows)",
-            )
+        _, cov_summary, cov_dicts = _compute_coverage(
+            combined,
+            all_episodes,
+            settings=settings,
+            series=series,
+            output_root=output_root,
         )
+        done_msg = (
+            f"All discs done — {counts['rename']} rename · {counts['split']} split · "
+            f"{counts['inventory_skip']} mega-skipped · {counts['extra']} no-eng extras "
+            f"({len(combined)} rows)"
+        )
+        if cov_summary:
+            done_msg += f"  |  Coverage: {cov_summary}"
+        _progress(ProgressEvent("done", len(discs), len(discs), done_msg))
         md = slog.finalize_scan(
             series_name=series.name,
             series_id=series.id,
@@ -444,6 +561,8 @@ def scan_and_identify(
                 "mode": "disc_by_disc",
                 "disc_count": len(discs),
                 "counts": counts,
+                "coverage": cov_dicts,
+                "coverage_summary": cov_summary,
             },
         )
         _progress(ProgressEvent("done", len(combined), len(combined), f"Review log: {md}"))
@@ -499,23 +618,35 @@ def scan_and_identify(
     )
     plan = finalize_plan_rows(plan)
     counts = plan_summary_counts(plan)
+    _, cov_summary, cov_dicts = _compute_coverage(
+        plan,
+        all_episodes,
+        settings=settings,
+        series=series,
+        output_root=output_root,
+    )
     md = slog.finalize_scan(
         series_name=series.name,
         series_id=series.id,
         folder=str(folder),
         output_root=str(output_root),
         plan=plan,
-        extra={"mode": "single_tree", "season_hint": season_hint, "counts": counts},
+        extra={
+            "mode": "single_tree",
+            "season_hint": season_hint,
+            "counts": counts,
+            "coverage": cov_dicts,
+            "coverage_summary": cov_summary,
+        },
     )
-    _progress(
-        ProgressEvent(
-            "done",
-            len(plan),
-            len(plan),
-            f"{counts['rename']} rename · {counts['split']} split · "
-            f"{counts['inventory_skip']} mega-skipped · Review log: {md}",
-        )
+    msg = (
+        f"{counts['rename']} rename · {counts['split']} split · "
+        f"{counts['inventory_skip']} mega-skipped"
     )
+    if cov_summary:
+        msg += f"  |  Coverage: {cov_summary}"
+    msg += f" · Review log: {md}"
+    _progress(ProgressEvent("done", len(plan), len(plan), msg))
     return plan
 
 
@@ -821,11 +952,26 @@ def _scan_one_tree(
                         path=str(mpath),
                     )
                 )
+                def _seg_prog(msg: str, _si=si, _n=len(segs), _mp=mpath.name) -> None:
+                    progress(
+                        ProgressEvent(
+                            "match",
+                            _si,
+                            _n,
+                            f"Identify segment {_si}/{_n} in {_mp}: {msg}",
+                            path=str(mpath),
+                        )
+                    )
+
                 identify_segment(
                     seg,
                     episodes,
                     low_threshold=settings.low_threshold,
                     auto_threshold=settings.auto_threshold,
+                    escalate_enabled=getattr(settings, "escalate_enabled", True),
+                    escalate_below=float(getattr(settings, "escalate_below", 80.0)),
+                    max_extra_samples=int(getattr(settings, "max_extra_samples", 2) or 0),
+                    progress=_seg_prog,
                 )
             segs = apply_covered_filter(segs, covered, skip_if_covered=skip_covered)
 
