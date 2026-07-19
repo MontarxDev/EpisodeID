@@ -274,45 +274,148 @@ def apply_splits(
     *,
     undo_dir: Path | None = None,
 ) -> tuple[list[dict], list[dict]]:
-    """Extract time ranges from multi-episode sources. Originals are never deleted."""
-    from episodeid.splitter import split_file_segment
+    """Extract multi-episode parts. Prefer MKVToolNix chapter split; ffmpeg fallback.
+
+    Originals are never deleted.
+    """
+    import shutil
+    import tempfile
+
+    from episodeid.splitter import (
+        row_uses_mkv_chapters,
+        split_file_segment,
+        split_via_mkvmerge_chapters,
+    )
 
     successes: list[dict] = []
     failures: list[dict] = []
     undo_entries: list[dict] = []
 
-    for row in rows:
-        if not row.selected or getattr(row, "row_kind", "rename") != "split":
-            continue
-        if row.split_start is None or row.split_end is None:
-            failures.append({"path": str(row.path), "error": "Missing split times"})
-            continue
-        if row.error or not row.proposed_name:
-            failures.append({"path": str(row.path), "error": row.error or "No proposed name"})
-            continue
-        if row.season is None or row.episode is None:
-            failures.append({"path": str(row.path), "error": "Missing season/episode"})
-            continue
-        src = row.path
-        if not src.exists():
-            failures.append({"path": str(src), "error": "Source file missing"})
-            continue
-        target_dir = row.target_dir or src.parent
-        dest = target_dir / row.proposed_name
-        try:
-            split_file_segment(src, float(row.split_start), float(row.split_end), dest)
-        except Exception as exc:
-            failures.append({"path": str(src), "error": str(exc)})
-            continue
-        entry = {
-            "type": "split",
-            "from": str(src),
-            "to": str(dest),
-            "start": row.split_start,
-            "end": row.split_end,
-        }
-        successes.append(entry)
-        undo_entries.append(entry)
+    selected = [
+        r
+        for r in rows
+        if r.selected and getattr(r, "row_kind", "rename") == "split"
+    ]
+    if not selected:
+        return successes, failures
+
+    # Group by source mega
+    by_src: dict[Path, list[RenamePlanRow]] = {}
+    for r in selected:
+        by_src.setdefault(Path(r.path), []).append(r)
+
+    handled: set[int] = set()  # id(row) processed via mkvmerge batch
+
+    for src, sel_rows in by_src.items():
+        # All split rows for this source (selected + not) → chapter order index
+        all_src = sorted(
+            [
+                r
+                for r in rows
+                if getattr(r, "row_kind", "") == "split" and Path(r.path) == src
+            ],
+            key=lambda r: (r.split_start is None, float(r.split_start or 0)),
+        )
+        # Prefer MKVToolNix "before chapters" when inventory used mkv_chapters
+        use_mkv = any(row_uses_mkv_chapters(r) for r in sel_rows + all_src)
+
+        if use_mkv and src.exists():
+            try:
+                with tempfile.TemporaryDirectory(prefix="episodeid_mkvsplit_") as td:
+                    parts = split_via_mkvmerge_chapters(src, Path(td))
+                    # Map chapter index → part (order = split_start order)
+                    for idx, row in enumerate(all_src):
+                        if not row.selected:
+                            continue
+                        if idx >= len(parts):
+                            failures.append(
+                                {
+                                    "path": str(src),
+                                    "error": f"mkvmerge part {idx + 1} missing for {row.original_name}",
+                                }
+                            )
+                            handled.add(id(row))
+                            continue
+                        if row.error or not row.proposed_name:
+                            failures.append(
+                                {"path": str(src), "error": row.error or "No proposed name"}
+                            )
+                            handled.add(id(row))
+                            continue
+                        if row.season is None or row.episode is None:
+                            failures.append(
+                                {"path": str(src), "error": "Missing season/episode"}
+                            )
+                            handled.add(id(row))
+                            continue
+                        target_dir = row.target_dir or src.parent
+                        dest = target_dir / row.proposed_name
+                        try:
+                            target_dir.mkdir(parents=True, exist_ok=True)
+                            if dest.exists():
+                                failures.append(
+                                    {"path": str(src), "error": f"Target exists: {dest.name}"}
+                                )
+                                handled.add(id(row))
+                                continue
+                            shutil.move(str(parts[idx]), str(dest))
+                        except OSError as exc:
+                            failures.append({"path": str(src), "error": str(exc)})
+                            handled.add(id(row))
+                            continue
+                        entry = {
+                            "type": "split",
+                            "backend": "mkvmerge_chapters",
+                            "from": str(src),
+                            "to": str(dest),
+                            "start": row.split_start,
+                            "end": row.split_end,
+                            "chapter_index": idx + 1,
+                        }
+                        successes.append(entry)
+                        undo_entries.append(entry)
+                        handled.add(id(row))
+                # If all selected handled, next source; else ffmpeg leftovers
+                if all(id(r) in handled for r in sel_rows):
+                    continue
+            except Exception:
+                # Fall through to ffmpeg per-row for this source
+                pass
+
+        for row in sel_rows:
+            if id(row) in handled:
+                continue
+            if row.split_start is None or row.split_end is None:
+                failures.append({"path": str(row.path), "error": "Missing split times"})
+                continue
+            if row.error or not row.proposed_name:
+                failures.append(
+                    {"path": str(row.path), "error": row.error or "No proposed name"}
+                )
+                continue
+            if row.season is None or row.episode is None:
+                failures.append({"path": str(row.path), "error": "Missing season/episode"})
+                continue
+            if not src.exists():
+                failures.append({"path": str(src), "error": "Source file missing"})
+                continue
+            target_dir = row.target_dir or src.parent
+            dest = target_dir / row.proposed_name
+            try:
+                split_file_segment(src, float(row.split_start), float(row.split_end), dest)
+            except Exception as exc:
+                failures.append({"path": str(src), "error": str(exc)})
+                continue
+            entry = {
+                "type": "split",
+                "backend": "ffmpeg",
+                "from": str(src),
+                "to": str(dest),
+                "start": row.split_start,
+                "end": row.split_end,
+            }
+            successes.append(entry)
+            undo_entries.append(entry)
 
     if undo_dir is not None and undo_entries:
         _append_undo(undo_dir, undo_entries)

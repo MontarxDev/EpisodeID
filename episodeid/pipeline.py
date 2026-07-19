@@ -884,6 +884,20 @@ def _scan_one_tree(
                 )
             )
             segs = inventory_segments(mpath, expected_runtime_min=med_rt)
+            if segs:
+                progress(
+                    ProgressEvent(
+                        "plan",
+                        0,
+                        1,
+                        f"{mpath.name}: {len(segs)} segment(s) via {segs[0].method}"
+                        + (
+                            f" (MKV chapters — same as MKVToolNix before-chapters)"
+                            if segs[0].method == "mkv_chapters"
+                            else ""
+                        ),
+                    )
+                )
             # Fast path: this disc already has as many good singles as segments → no need to split mega
             disc_root = mpath.parent
             disc_singles = 0
@@ -1029,6 +1043,8 @@ def _scan_one_tree(
                 else:
                     kind = "split"
                     flags = list(seg.flags) + ["split_segment"]
+                    if seg.method == "mkv_chapters" and "mkv_chapters" not in flags:
+                        flags.append("mkv_chapters")
                     conf_ok = (
                         seg.season is not None
                         and not seg.error

@@ -60,7 +60,7 @@ class SplitSegment:
         return f"S{self.season:02d}E{self.episode:02d}"
 
 
-def probe_chapters(path: Path) -> list[Chapter]:
+def probe_chapters_ffprobe(path: Path) -> list[Chapter]:
     ffprobe = which("ffprobe")
     if not ffprobe:
         return []
@@ -99,6 +99,122 @@ def probe_chapters(path: Path) -> list[Chapter]:
             )
         )
     return out
+
+
+def probe_chapters_mkvmerge(path: Path) -> list[Chapter]:
+    """Fallback chapter probe via mkvmerge -J / chapter XML extract."""
+    mkvmerge = which("mkvmerge")
+    if not mkvmerge:
+        return []
+    # Prefer identify JSON when it embeds chapter times (varies by version)
+    proc = run_cmd([mkvmerge, "-J", str(path)], timeout=120)
+    if proc.returncode == 0:
+        try:
+            data = json.loads(proc.stdout or "{}")
+        except json.JSONDecodeError:
+            data = {}
+        # Some builds only report num_entries; then fall through to XML
+        chapters_block = data.get("chapters") or []
+        # Try nested structure if present
+        atoms: list[dict] = []
+
+        def _walk(obj: object) -> None:
+            if isinstance(obj, dict):
+                if "ChapterTimeStart" in obj or "chapter_time_start" in obj:
+                    atoms.append(obj)
+                for v in obj.values():
+                    _walk(v)
+            elif isinstance(obj, list):
+                for v in obj:
+                    _walk(v)
+
+        _walk(chapters_block)
+        if atoms:
+            out: list[Chapter] = []
+            for i, a in enumerate(atoms):
+                # nanosecond strings sometimes
+                def _ts(key: str) -> float:
+                    raw = a.get(key) or a.get(key.replace("Chapter", "chapter")) or 0
+                    if isinstance(raw, (int, float)):
+                        # if looks like ns
+                        return float(raw) / 1e9 if float(raw) > 1e6 else float(raw)
+                    s = str(raw)
+                    # HH:MM:SS.nnnnnnnnn
+                    parts = s.replace(".", ":").split(":")
+                    try:
+                        if len(parts) >= 3:
+                            h, m, sec = int(parts[0]), int(parts[1]), float(parts[2] + ("." + parts[3] if len(parts) > 3 else ""))
+                            return h * 3600 + m * 60 + sec
+                    except ValueError:
+                        pass
+                    try:
+                        return float(s) / 1e9 if float(s) > 1e6 else float(s)
+                    except ValueError:
+                        return 0.0
+
+                start = _ts("ChapterTimeStart") if "ChapterTimeStart" in a else _ts("chapter_time_start")
+                end = _ts("ChapterTimeEnd") if "ChapterTimeEnd" in a else _ts("chapter_time_end")
+                if end <= start:
+                    continue
+                title = ""
+                displays = a.get("ChapterDisplays") or a.get("chapter_displays") or []
+                if displays and isinstance(displays, list):
+                    title = str((displays[0] or {}).get("ChapterString") or "")
+                out.append(Chapter(index=i, start=start, end=end, title=title))
+            if out:
+                return out
+
+    # XML extract fallback
+    mkvextract = which("mkvextract")
+    if not mkvextract:
+        return []
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="episodeid_ch_") as td:
+        xml_path = Path(td) / "chapters.xml"
+        proc = run_cmd(
+            [mkvextract, str(path), "chapters", str(xml_path)],
+            timeout=120,
+        )
+        if proc.returncode != 0 or not xml_path.exists():
+            return []
+        text = xml_path.read_text(encoding="utf-8", errors="replace")
+    # Minimal XML parse without extra deps
+    times = re.findall(
+        r"<ChapterTimeStart>([^<]+)</ChapterTimeStart>\s*<ChapterTimeEnd>([^<]+)</ChapterTimeEnd>",
+        text,
+        flags=re.I,
+    )
+    titles = re.findall(r"<ChapterString>([^<]*)</ChapterString>", text, flags=re.I)
+
+    def _parse_ts(s: str) -> float:
+        s = s.strip()
+        # 00:24:23.261800000
+        m = re.match(r"(\d+):(\d+):(\d+(?:\.\d+)?)", s)
+        if m:
+            return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+        try:
+            return float(s)
+        except ValueError:
+            return 0.0
+
+    out = []
+    for i, (st, en) in enumerate(times):
+        start, end = _parse_ts(st), _parse_ts(en)
+        if end <= start:
+            continue
+        title = titles[i] if i < len(titles) else ""
+        out.append(Chapter(index=i, start=start, end=end, title=title))
+    return out
+
+
+def probe_chapters(path: Path) -> list[Chapter]:
+    """Best available chapter list (ffprobe first, mkvmerge/mkvextract fallback)."""
+    ch = probe_chapters_ffprobe(path)
+    if len(ch) >= 2:
+        return ch
+    ch2 = probe_chapters_mkvmerge(path)
+    return ch2 if len(ch2) > len(ch) else ch
 
 
 def is_multi_episode_candidate(
@@ -208,6 +324,51 @@ def expected_segment_count(
     return max(1, int(round(file_duration / target)))
 
 
+def chapters_as_episode_segments(
+    chapters: list[Chapter],
+    file_duration: float,
+    *,
+    min_ep_min: float = 12.0,
+    max_ep_min: float = 40.0,
+    min_cover_ratio: float = 0.85,
+) -> list[tuple[float, float]] | None:
+    """If MKV chapters already look like one episode each, return their spans.
+
+    S7 Blu-ray rips: 4 chapters of ~18–27 min — use as-is (never equal-time grid).
+    Returns None when chapters look like menus/bumpers instead.
+    """
+    if not chapters or file_duration <= 0:
+        return None
+    min_s = min_ep_min * 60.0
+    max_s = max_ep_min * 60.0
+    # Prefer chapters already episode-length
+    ep_chs = [ch for ch in chapters if min_s <= ch.duration <= max_s]
+    if len(ep_chs) < 2:
+        # Sometimes last chapter slightly short/long — allow slightly wider band
+        ep_chs = [
+            ch
+            for ch in chapters
+            if (min_s * 0.75) <= ch.duration <= (max_s * 1.15) and ch.duration >= 8 * 60
+        ]
+    if len(ep_chs) < 2:
+        return None
+    # Cover most of the file
+    covered = sum(ch.duration for ch in ep_chs)
+    if covered < file_duration * min_cover_ratio:
+        return None
+    # Sort and use exact chapter boundaries
+    ep_chs = sorted(ep_chs, key=lambda c: c.start)
+    pairs = [(ch.start, ch.end) for ch in ep_chs]
+    # Extend last end to file duration if tiny tail remains
+    if pairs and file_duration - pairs[-1][1] < 90 and pairs[-1][1] < file_duration:
+        s, _ = pairs[-1]
+        pairs[-1] = (s, file_duration)
+    # Ensure first starts at 0 if tiny lead-in
+    if pairs and pairs[0][0] > 0 and pairs[0][0] < 30:
+        pairs[0] = (0.0, pairs[0][1])
+    return pairs
+
+
 def inventory_segments(
     path: Path,
     *,
@@ -215,8 +376,11 @@ def inventory_segments(
 ) -> list[SplitSegment]:
     """Build un-identified segments for a multi-episode file.
 
-    Prefers chapter clustering, but if chapters under-segment relative to
-    duration/median runtime (common on S7 mega files), forces a duration grid.
+    Priority:
+      1. Episode-length MKV chapters (S7: 4 chapters → 4 segments) — never
+         overridden by duration/median math.
+      2. Short-bumper chapter clustering (S1-style megas).
+      3. Equal duration grid as last resort.
     """
     path = Path(path)
     duration = probe_duration_seconds(path)
@@ -225,32 +389,39 @@ def inventory_segments(
     expected_n = expected_segment_count(duration, expected_runtime_min)
     chapters = probe_chapters(path)
     method = "auto"
+    pairs: list[tuple[float, float]] = []
+
     if chapters:
-        pairs = cluster_chapters_into_episodes(
-            chapters,
-            file_duration=duration,
-            expected_runtime_min=expected_runtime_min,
-        )
-        method = "chapters"
-        # Under-segmented vs duration estimate → force equal grid
-        if expected_n >= 3 and len(pairs) < expected_n - 1:
-            pairs = auto_grid_segments(
-                duration, expected_runtime_min, force_n=expected_n
+        # Rule A: chapters already = episodes (MKVToolNix "before chapters")
+        direct = chapters_as_episode_segments(chapters, duration)
+        if direct:
+            pairs = direct
+            method = "mkv_chapters"
+        else:
+            pairs = cluster_chapters_into_episodes(
+                chapters,
+                file_duration=duration,
+                expected_runtime_min=expected_runtime_min,
             )
-            method = "auto_forced"
-        # Over-fragmented (too many short pieces) also re-grid
-        elif len(pairs) >= expected_n + 2 and expected_n >= 2:
-            pairs = auto_grid_segments(
-                duration, expected_runtime_min, force_n=expected_n
-            )
-            method = "auto_forced"
+            method = "chapter_cluster"
+            # Only re-grid when clustering failed (not when Rule A succeeded)
+            if expected_n >= 3 and len(pairs) < expected_n - 1:
+                pairs = auto_grid_segments(
+                    duration, expected_runtime_min, force_n=expected_n
+                )
+                method = "auto_grid"
+            elif len(pairs) >= expected_n + 2 and expected_n >= 2:
+                pairs = auto_grid_segments(
+                    duration, expected_runtime_min, force_n=expected_n
+                )
+                method = "auto_grid"
     else:
         pairs = auto_grid_segments(
             duration,
             expected_runtime_min,
             force_n=expected_n if expected_n >= 2 else None,
         )
-        method = "auto"
+        method = "auto_grid"
 
     return [
         SplitSegment(source=path, start=s, end=e, method=method)
@@ -639,6 +810,68 @@ def scan_output_library_for_episodes(output_root: Path) -> dict[tuple[int, int],
         key = (int(m.group(1)), int(m.group(2)))
         found.setdefault(key, str(p))
     return found
+
+
+def split_via_mkvmerge_chapters(
+    source: Path,
+    out_dir: Path,
+    *,
+    pattern: str = "part-%03d.mkv",
+) -> list[Path]:
+    """Split mega using MKVToolNix 'before chapters' mode (chapters:all).
+
+    Same as GUI: Split mode → Before chapters → all.
+    Returns output paths sorted in chapter order. Original is never modified.
+    """
+    mkvmerge = which("mkvmerge")
+    if not mkvmerge:
+        raise RuntimeError("mkvmerge not found (install mkvtoolnix)")
+    source = Path(source)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # Clear previous parts in this work dir
+    for old in out_dir.glob("part-*.mkv"):
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    out_template = str(out_dir / pattern)
+    cmd = [
+        mkvmerge,
+        "-o",
+        out_template,
+        "--split",
+        "chapters:all",
+        str(source),
+    ]
+    proc = run_cmd(cmd, timeout=7200)
+    # mkvmerge may return 1 for warnings
+    if proc.returncode not in (0, 1):
+        raise RuntimeError(
+            (proc.stderr or proc.stdout or "mkvmerge chapter split failed").strip()[:500]
+        )
+    parts = sorted(out_dir.glob("part-*.mkv"))
+    # Some versions use -001 suffix differently
+    if not parts:
+        parts = sorted(
+            p
+            for p in out_dir.iterdir()
+            if p.is_file() and p.suffix.lower() == ".mkv" and p.name != source.name
+        )
+    parts = [p for p in parts if p.stat().st_size > 1000]
+    if not parts:
+        raise RuntimeError("mkvmerge produced no chapter parts")
+    return parts
+
+
+def row_uses_mkv_chapters(row: object) -> bool:
+    """Whether this plan row was inventoried from episode-length MKV chapters."""
+    track = str(getattr(row, "track_info", "") or "")
+    flags = getattr(row, "flags", None) or []
+    if "mkv_chapters" in track or any("mkv_chapters" in str(f) for f in flags):
+        return True
+    method = track.split()[0] if track else ""
+    return method == "mkv_chapters"
 
 
 def split_file_segment(
