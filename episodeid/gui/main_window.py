@@ -67,6 +67,7 @@ class MainWindow(QMainWindow):
         self.plan: list[RenamePlanRow] = []
         self._thread: QThread | None = None
         self._worker = None
+        self._session_log = None  # SessionLog from last scan
         self._search_results: list[SeriesInfo] = []
 
         self._build_ui()
@@ -439,8 +440,18 @@ class MainWindow(QMainWindow):
     def _on_scan_finished(self, plan: list) -> None:
         self.plan = list(plan)
         self._fill_table()
-        self.progress_label.setText(f"Done — {len(self.plan)} file(s). Review and apply renames.")
-        self.statusBar().showMessage(f"Scan complete: {len(self.plan)} rows")
+        # Keep session log for apply + user review path
+        if self._worker and getattr(self._worker, "session_log", None):
+            self._session_log = self._worker.session_log
+        log_hint = ""
+        if self._session_log:
+            log_hint = f" · Log: {self._session_log.dir}"
+        self.progress_label.setText(
+            f"Done — {len(self.plan)} row(s). Review table, then Apply.{log_hint}"
+        )
+        self.statusBar().showMessage(
+            f"Scan complete: {len(self.plan)} rows{log_hint}"
+        )
 
     def _fill_table(self) -> None:
         self.table.blockSignals(True)
@@ -640,7 +651,7 @@ class MainWindow(QMainWindow):
 
         self.apply_btn.setEnabled(False)
         self._thread = QThread(self)
-        self._worker = ApplyWorker(self.plan, undo_dir())
+        self._worker = ApplyWorker(self.plan, undo_dir(), session_log=self._session_log)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.finished.connect(self._on_apply_finished)
@@ -652,11 +663,15 @@ class MainWindow(QMainWindow):
 
     def _on_apply_finished(self, successes: list, failures: list) -> None:
         self.apply_btn.setEnabled(True)
-        msg = f"Renamed {len(successes)} file(s)."
+        n_split = sum(1 for s in successes if (s.get("type") or "rename") == "split")
+        n_ren = len(successes) - n_split
+        msg = f"Applied {n_ren} rename(s) and {n_split} split(s)."
         if failures:
             msg += f"\n{len(failures)} failed:\n" + "\n".join(
                 f"{f.get('path')}: {f.get('error')}" for f in failures[:10]
             )
+        if self._session_log:
+            msg += f"\n\nFull log for review:\n{self._session_log.dir}"
         QMessageBox.information(self, "Apply complete", msg)
         self.statusBar().showMessage(msg.split("\n")[0])
         # Refresh original names in table for successes

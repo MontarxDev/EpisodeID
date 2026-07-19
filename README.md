@@ -138,7 +138,12 @@ Free path (layered for accuracy):
 - Settings → Accuracy: TVMaze + Wyzie ref SRTs (cache survives reboot)  
 - Settings → **Cache** tab for clear/open/stats  
 - **Retry problem rows** for weak/dupe rows only  
-- Scan logs: `~/.local/share/episodeid/scans/`
+- **Review logs** (after every scan): `~/.local/share/episodeid/sessions/LATEST/`  
+  - `summary.md` — human review of matches / skips / problems  
+  - `summary.json` — full machine-readable plan  
+  - `events.log` — live progress  
+  - `apply.json` — written after Apply  
+- Legacy scan JSON also under `~/.local/share/episodeid/scans/`
 
 Confidence bands (defaults):
 

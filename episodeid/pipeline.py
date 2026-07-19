@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from episodeid.config import KEY_GEMINI, KEY_WYZIE, Settings, data_dir, get_secret
 from episodeid.edge_cases import (
@@ -319,28 +319,46 @@ def scan_and_identify(
     api_key: str | None = None,
     progress: ProgressCb | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    session_log: Any | None = None,
 ) -> list[RenamePlanRow]:
     """Identify all videos in folder (and subfolders). Never renames files."""
+    from episodeid.session_log import SessionLog
+
     settings = settings or Settings()
     progress = progress or _noop_progress
     cancel_check = cancel_check or (lambda: False)
     folder = Path(folder)
 
+    slog = session_log or SessionLog("scan")
+    slog.save_settings_snapshot(settings)
+    slog.log(
+        "scan_config",
+        "Starting scan",
+        folder=str(folder),
+        series=series.name,
+        series_id=series.id,
+    )
+
+    def _progress(ev: ProgressEvent) -> None:
+        slog.progress_callback(ev)
+        progress(ev)
+
     if episodes is None:
         if not api_key:
             raise ValueError("TMDB API key required when episodes not provided")
-        progress(ProgressEvent("metadata", 0, 1, "Fetching episode list from TMDB…"))
+        _progress(ProgressEvent("metadata", 0, 1, "Fetching episode list from TMDB…"))
         client = TMDBClient(api_key)
         episodes = client.get_all_episodes(series.id)
 
     if getattr(settings, "use_tvmaze", True):
-        progress(ProgressEvent("metadata", 0, 1, "Enriching episode plots via TVMaze (free)…"))
+        _progress(ProgressEvent("metadata", 0, 1, "Enriching episode plots via TVMaze (free)…"))
         try:
             episodes = enrich_episodes_with_tvmaze(list(episodes), series.name)
         except Exception as exc:
-            progress(ProgressEvent("metadata", 0, 1, f"TVMaze skipped: {exc}"))
+            _progress(ProgressEvent("metadata", 0, 1, f"TVMaze skipped: {exc}"))
 
     all_episodes = list(episodes)
+    output_root = _resolve_output_root(folder, settings)
 
     # Disc-by-disc when scanning a parent of many disc folders
     discs = discover_disc_folders(folder)
@@ -350,7 +368,7 @@ def scan_and_identify(
         and not (getattr(settings, "season_filter", None) or 0)
     )
     if use_disc_mode:
-        progress(
+        _progress(
             ProgressEvent(
                 "scan",
                 0,
@@ -370,7 +388,8 @@ def scan_and_identify(
             label = f"Disc {di}/{len(discs)}: {disc.name}"
             if season_hint:
                 label += f" (auto S{season_hint:02d})"
-            progress(ProgressEvent("scan", di, len(discs), label))
+            _progress(ProgressEvent("scan", di, len(discs), label))
+            slog.log("disc_start", label, path=str(disc), season_hint=season_hint)
             disc_eps = all_episodes
             if season_hint:
                 disc_eps = [e for e in all_episodes if e.season == season_hint]
@@ -382,13 +401,14 @@ def scan_and_identify(
                 episodes=disc_eps,
                 all_series_episodes=all_episodes,
                 settings=settings,
-                progress=progress,
+                progress=_progress,
                 cancel_check=cancel_check,
                 season_hint=season_hint,
                 library_root=folder,
             )
             combined.extend(part)
-        progress(
+            slog.log("disc_end", f"Finished {disc.name}", rows=len(part))
+        _progress(
             ProgressEvent(
                 "done",
                 len(discs),
@@ -396,6 +416,15 @@ def scan_and_identify(
                 f"All discs done — {len(combined)} plan row(s)",
             )
         )
+        md = slog.finalize_scan(
+            series_name=series.name,
+            series_id=series.id,
+            folder=str(folder),
+            output_root=str(output_root),
+            plan=combined,
+            extra={"mode": "disc_by_disc", "disc_count": len(discs)},
+        )
+        _progress(ProgressEvent("done", len(combined), len(combined), f"Review log: {md}"))
         return combined
 
     # Single folder / explicit season filter path
@@ -404,7 +433,7 @@ def scan_and_identify(
     if season_filter and int(season_filter) > 0:
         sf = int(season_filter)
         episodes = [e for e in all_episodes if e.season == sf]
-        progress(
+        _progress(
             ProgressEvent(
                 "metadata",
                 0,
@@ -419,7 +448,7 @@ def scan_and_identify(
         if season_hint:
             episodes = [e for e in all_episodes if e.season == season_hint]
             if episodes:
-                progress(
+                _progress(
                     ProgressEvent(
                         "metadata",
                         0,
@@ -435,17 +464,27 @@ def scan_and_identify(
     else:
         episodes = all_episodes
 
-    return _scan_one_tree(
+    plan = _scan_one_tree(
         folder=folder,
         series=series,
         episodes=episodes,
         all_series_episodes=all_episodes,
         settings=settings,
-        progress=progress,
+        progress=_progress,
         cancel_check=cancel_check,
         season_hint=season_hint,
         library_root=folder,
     )
+    md = slog.finalize_scan(
+        series_name=series.name,
+        series_id=series.id,
+        folder=str(folder),
+        output_root=str(output_root),
+        plan=plan,
+        extra={"mode": "single_tree", "season_hint": season_hint},
+    )
+    _progress(ProgressEvent("done", len(plan), len(plan), f"Review log: {md}"))
+    return plan
 
 
 def _attach_refs_for_episodes(
