@@ -201,13 +201,17 @@ def apply_renames(
     *,
     undo_dir: Path | None = None,
 ) -> tuple[list[dict], list[dict]]:
-    """Apply selected rows. Returns (successes, failures)."""
+    """Apply selected rename rows (not splits). Returns (successes, failures)."""
     successes: list[dict] = []
     failures: list[dict] = []
     undo_entries: list[dict] = []
 
     for row in rows:
         if not row.selected:
+            continue
+        if getattr(row, "row_kind", "rename") == "split":
+            continue  # handled by apply_splits
+        if getattr(row, "row_kind", "rename") == "inventory_skip":
             continue
         if row.error or not row.proposed_name:
             failures.append({"path": str(row.path), "error": row.error or "No proposed name"})
@@ -240,7 +244,6 @@ def apply_renames(
             pass
 
         try:
-            # rename is fast same-filesystem; shutil.move works across drives
             try:
                 src.rename(dest)
             except OSError:
@@ -249,22 +252,98 @@ def apply_renames(
             failures.append({"path": str(src), "error": str(exc)})
             continue
 
-        entry = {"from": str(src), "to": str(dest)}
+        entry = {"type": "rename", "from": str(src), "to": str(dest)}
         successes.append(entry)
         undo_entries.append(entry)
         row.path = dest
         row.original_name = dest.name
 
     if undo_dir is not None and undo_entries:
-        undo_dir.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        undo_path = undo_dir / f"{stamp}.json"
-        undo_path.write_text(
-            json.dumps({"created": stamp, "operations": undo_entries}, indent=2),
-            encoding="utf-8",
-        )
+        _append_undo(undo_dir, undo_entries)
 
     return successes, failures
+
+
+def apply_splits(
+    rows: list[RenamePlanRow],
+    *,
+    undo_dir: Path | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """Extract time ranges from multi-episode sources. Originals are never deleted."""
+    from episodeid.splitter import split_file_segment
+
+    successes: list[dict] = []
+    failures: list[dict] = []
+    undo_entries: list[dict] = []
+
+    for row in rows:
+        if not row.selected or getattr(row, "row_kind", "rename") != "split":
+            continue
+        if row.split_start is None or row.split_end is None:
+            failures.append({"path": str(row.path), "error": "Missing split times"})
+            continue
+        if row.error or not row.proposed_name:
+            failures.append({"path": str(row.path), "error": row.error or "No proposed name"})
+            continue
+        if row.season is None or row.episode is None:
+            failures.append({"path": str(row.path), "error": "Missing season/episode"})
+            continue
+        src = row.path
+        if not src.exists():
+            failures.append({"path": str(src), "error": "Source file missing"})
+            continue
+        target_dir = row.target_dir or src.parent
+        dest = target_dir / row.proposed_name
+        try:
+            split_file_segment(src, float(row.split_start), float(row.split_end), dest)
+        except Exception as exc:
+            failures.append({"path": str(src), "error": str(exc)})
+            continue
+        entry = {
+            "type": "split",
+            "from": str(src),
+            "to": str(dest),
+            "start": row.split_start,
+            "end": row.split_end,
+        }
+        successes.append(entry)
+        undo_entries.append(entry)
+
+    if undo_dir is not None and undo_entries:
+        _append_undo(undo_dir, undo_entries)
+    return successes, failures
+
+
+def apply_all_selected(
+    rows: list[RenamePlanRow],
+    *,
+    undo_dir: Path | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """Apply renames and splits for selected rows."""
+    ok1, err1 = apply_renames(rows, undo_dir=None)
+    ok2, err2 = apply_splits(rows, undo_dir=None)
+    successes = ok1 + ok2
+    failures = err1 + err2
+    if undo_dir is not None and successes:
+        _append_undo(undo_dir, successes)
+    return successes, failures
+
+
+def _append_undo(undo_dir: Path, entries: list[dict]) -> None:
+    undo_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    undo_path = undo_dir / f"{stamp}.json"
+    # merge if same-second
+    existing: list[dict] = []
+    if undo_path.exists():
+        try:
+            existing = json.loads(undo_path.read_text(encoding="utf-8")).get("operations") or []
+        except (OSError, json.JSONDecodeError):
+            existing = []
+    undo_path.write_text(
+        json.dumps({"created": stamp, "operations": existing + entries}, indent=2),
+        encoding="utf-8",
+    )
 
 
 def undo_last(undo_dir: Path) -> tuple[list[dict], list[dict]]:
@@ -278,7 +357,21 @@ def undo_last(undo_dir: Path) -> tuple[list[dict], list[dict]]:
     successes: list[dict] = []
     failures: list[dict] = []
     for op in reversed(ops):
-        src = Path(op["to"])
+        op_type = op.get("type") or "rename"
+        created = Path(op["to"])
+        if op_type == "split":
+            # Split: original mega kept; undo = delete created file only
+            if not created.exists():
+                failures.append({"path": str(created), "error": "Split output missing for undo"})
+                continue
+            try:
+                created.unlink()
+                successes.append({"type": "split_undo", "removed": str(created)})
+            except OSError as exc:
+                failures.append({"path": str(created), "error": str(exc)})
+            continue
+
+        src = created
         dest = Path(op["from"])
         if not src.exists():
             failures.append({"path": str(src), "error": "File missing for undo"})
@@ -288,11 +381,13 @@ def undo_last(undo_dir: Path) -> tuple[list[dict], list[dict]]:
             continue
         try:
             dest.parent.mkdir(parents=True, exist_ok=True)
-            src.rename(dest)
+            try:
+                src.rename(dest)
+            except OSError:
+                shutil.move(str(src), str(dest))
             successes.append({"from": str(src), "to": str(dest)})
         except OSError as exc:
             failures.append({"path": str(src), "error": str(exc)})
-    # rename log so it is not re-used as latest
     logs[0].rename(logs[0].with_suffix(".json.undone"))
     return successes, failures
 

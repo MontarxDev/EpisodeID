@@ -20,6 +20,14 @@ from episodeid.extractor import (
     probe_duration_seconds,
     sample_dialogue,
 )
+from episodeid.splitter import (
+    apply_covered_filter,
+    identify_segment,
+    inventory_segments,
+    is_multi_episode_candidate,
+    median_runtime_minutes,
+    scan_output_library_for_episodes,
+)
 from episodeid.llm import identify_with_llm
 from episodeid.matcher import (
     demote_duplicate_claims,
@@ -373,33 +381,58 @@ def scan_and_identify(
         )
     )
 
-    keep, skipped = filter_by_size(
+    # Size filter for extras; megas pulled aside when multi-episode detection is on
+    keep, size_skipped = filter_by_size(
         files,
         enabled=settings.size_filter_enabled,
         ratio=settings.size_filter_ratio,
+        max_ratio=2.5 if not getattr(settings, "detect_multi_episode", True) else 99.0,
     )
-    if skipped:
-        progress(
-            ProgressEvent(
-                "scan",
-                0,
-                len(keep),
-                f"Identifying {len(keep)} episode-sized file(s); skipped {len(skipped)} extra/mega file(s)",
-            )
-        )
+    # When multi-ep on, re-include large files that size filter would drop via max_ratio
+    # (we set max_ratio high above). Still drop tiny extras from keep.
+    med_rt = median_runtime_minutes(episodes)
+    singles: list[Path] = []
+    megas: list[Path] = []
+    for p in keep:
+        dur = probe_duration_seconds(p)
+        if getattr(settings, "detect_multi_episode", True) and is_multi_episode_candidate(
+            dur, median_runtime_min=med_rt
+        ):
+            megas.append(p)
+        else:
+            singles.append(p)
 
+    # Also check size_skipped for multi-ep when max_ratio was not used
+    if getattr(settings, "detect_multi_episode", True):
+        for p in size_skipped:
+            dur = probe_duration_seconds(p)
+            if is_multi_episode_candidate(dur, median_runtime_min=med_rt):
+                if p not in megas:
+                    megas.append(p)
+
+    progress(
+        ProgressEvent(
+            "scan",
+            0,
+            len(singles) + len(megas),
+            f"Singles {len(singles)} · multi-episode candidates {len(megas)} · "
+            f"skipped extras {len(size_skipped) - sum(1 for p in size_skipped if p in megas)}",
+        )
+    )
+
+    # ----- Pass A: singles -----
     results: list[MatchResult] = []
     score_matrix: list[list[float]] = []
-    total = len(keep)
-    for idx, path in enumerate(keep, start=1):
+    total_a = len(singles)
+    for idx, path in enumerate(singles, start=1):
         if cancel_check():
             break
         progress(
             ProgressEvent(
                 "extract",
                 idx,
-                total,
-                f"Extracting dialogue ({idx}/{total}): {path.name}",
+                total_a,
+                f"Single ({idx}/{total_a}): {path.name}",
                 path=str(path),
             )
         )
@@ -407,7 +440,7 @@ def scan_and_identify(
         results.append(match)
         score_matrix.append(scores)
 
-    progress(ProgressEvent("plan", total, total, "Resolving unique episode assignments…"))
+    progress(ProgressEvent("plan", total_a, total_a, "Resolving unique assignments for singles…"))
     results = reassign_unique_episodes(
         results,
         episodes,
@@ -418,7 +451,6 @@ def scan_and_identify(
     results = mark_content_duplicates(results)
     results = demote_duplicate_claims(results)
 
-    # Multipart: allow same SxxExx — clear duplicate_claim between multiparts of same ep
     by_code: dict[tuple[int, int], list[int]] = {}
     for i, r in enumerate(results):
         if r.season is None or r.episode is None:
@@ -433,11 +465,10 @@ def scan_and_identify(
                 results[i].low_confidence = results[i].confidence < settings.low_threshold
 
     if settings.auto_resolve_problems:
-        progress(ProgressEvent("plan", total, total, "Auto-resolving duplicates & weak matches…"))
+        progress(ProgressEvent("plan", total_a, total_a, "Auto-resolving singles…"))
         results = _second_pass_resolve(results, score_matrix, episodes, settings)
         results = demote_duplicate_claims(results)
 
-    progress(ProgressEvent("plan", total, total, "Building rename plan…"))
     output_root = _resolve_output_root(folder, settings)
     plan = build_plan(
         results,
@@ -453,7 +484,6 @@ def scan_and_identify(
         rename_in_place=getattr(settings, "rename_in_place", False),
     )
 
-    # Multipart rename suffix
     for row in plan:
         part_flags = [f for f in row.flags if f.startswith("multipart:")]
         if part_flags and row.proposed_name and row.season is not None:
@@ -466,7 +496,6 @@ def scan_and_identify(
                 ext = Path(row.proposed_name).suffix
                 row.proposed_name = f"{stem} - Part {part_n}{ext}"
 
-    # Unselect problem rows that still failed
     for row in plan:
         if any(
             f in row.flags
@@ -476,14 +505,155 @@ def scan_and_identify(
         if row.error:
             row.selected = False
 
-    ok = sum(1 for r in plan if r.selected)
-    review = sum(1 for r in plan if not r.selected and r.season and not r.error)
-    failed = sum(1 for r in plan if r.error or r.season is None)
+    # Covered set from good single matches
+    covered: dict[tuple[int, int], str] = {}
+    for row in plan:
+        if row.season is None or row.episode is None:
+            continue
+        if row.error or row.confidence < settings.low_threshold:
+            continue
+        if "content_duplicate" in row.flags:
+            continue
+        covered[(row.season, row.episode)] = str(row.path)
+
+    if getattr(settings, "skip_split_if_in_output_library", True):
+        lib_root = output_root
+        if getattr(settings, "output_create_series_subfolder", True):
+            from episodeid.renamer import sanitize_filename
+
+            lib_root = output_root / sanitize_filename(series.name)
+        for k, v in scan_output_library_for_episodes(lib_root).items():
+            covered.setdefault(k, v)
+
+    # ----- Pass B: multi-episode inventory + gap-only splits -----
+    split_rows: list[RenamePlanRow] = []
+    if getattr(settings, "detect_multi_episode", True) and megas:
+        skip_covered = (
+            getattr(settings, "skip_split_if_episode_present", True)
+            and not getattr(settings, "force_splits_even_if_present", False)
+        )
+        for mi, mpath in enumerate(megas, start=1):
+            if cancel_check():
+                break
+            progress(
+                ProgressEvent(
+                    "extract",
+                    mi,
+                    len(megas),
+                    f"Inventory multi-episode ({mi}/{len(megas)}): {mpath.name}",
+                    path=str(mpath),
+                )
+            )
+            segs = inventory_segments(mpath, expected_runtime_min=med_rt)
+            for si, seg in enumerate(segs, start=1):
+                progress(
+                    ProgressEvent(
+                        "match",
+                        si,
+                        len(segs),
+                        f"Identify segment {si}/{len(segs)} in {mpath.name} "
+                        f"({seg.start/60:.1f}–{seg.end/60:.1f}m)",
+                        path=str(mpath),
+                    )
+                )
+                identify_segment(
+                    seg,
+                    episodes,
+                    low_threshold=settings.low_threshold,
+                    auto_threshold=settings.auto_threshold,
+                )
+            segs = apply_covered_filter(segs, covered, skip_if_covered=skip_covered)
+
+            for seg in segs:
+                proposed = ""
+                target = output_root
+                if seg.season is not None and seg.episode is not None:
+                    from episodeid.renamer import format_new_name, resolve_target_dir
+
+                    proposed = format_new_name(
+                        series=series.name,
+                        season=seg.season,
+                        episode=seg.episode,
+                        title=seg.title or "Unknown",
+                        ext=mpath.suffix,
+                        fmt=settings.rename_format,
+                    )
+                    target = resolve_target_dir(
+                        season=seg.season if settings.move_to_season else None,
+                        scan_root=folder,
+                        output_root=output_root,
+                        series_name=series.name,
+                        move_to_season=settings.move_to_season,
+                        create_series_subfolder=getattr(
+                            settings, "output_create_series_subfolder", True
+                        ),
+                        source_path=mpath,
+                    )
+
+                if seg.skip:
+                    kind = "inventory_skip"
+                    selected = False
+                    flags = list(seg.flags) + ["inventory_skip"]
+                else:
+                    kind = "split"
+                    selected = (
+                        seg.season is not None
+                        and not seg.error
+                        and seg.confidence >= settings.low_threshold
+                    )
+                    flags = list(seg.flags) + ["split_segment"]
+
+                # Mark covered so later megas don't re-propose
+                if selected and seg.season is not None and seg.episode is not None:
+                    covered[(seg.season, seg.episode)] = f"{mpath.name}@{seg.start:.0f}"
+
+                split_rows.append(
+                    RenamePlanRow(
+                        path=mpath,
+                        original_name=(
+                            f"{mpath.name} [{seg.start/60:.1f}–{seg.end/60:.1f}m]"
+                        ),
+                        season=seg.season,
+                        episode=seg.episode,
+                        official_title=seg.title or "",
+                        confidence=seg.confidence,
+                        proposed_name=proposed or mpath.name,
+                        target_dir=target,
+                        selected=selected,
+                        move_to_season=settings.move_to_season,
+                        error=seg.error,
+                        dialogue_source="segment_ocr",
+                        flags=flags,
+                        dialogue_lines=list(seg.dialogue_lines),
+                        sample_quality=seg.sample_quality,
+                        track_info=f"{seg.method} {seg.start:.1f}-{seg.end:.1f}s",
+                        row_kind=kind,
+                        split_start=seg.start,
+                        split_end=seg.end,
+                        skip_reason=seg.skip_reason,
+                        covered_by=seg.covered_by,
+                    )
+                )
+
+    plan = list(plan) + split_rows
+
+    ok = sum(1 for r in plan if r.selected and r.row_kind == "rename")
+    splits = sum(1 for r in plan if r.selected and r.row_kind == "split")
+    skipped_inv = sum(1 for r in plan if r.row_kind == "inventory_skip")
+    review = sum(
+        1
+        for r in plan
+        if not r.selected and r.season and not r.error and r.row_kind != "inventory_skip"
+    )
+    failed = sum(1 for r in plan if r.error or (r.season is None and r.row_kind == "rename"))
     log_path = _write_scan_log(plan, series, folder)
-    msg = f"Matched {ok} · Review {review} · Failed {failed}"
+    msg = (
+        f"Matched {ok} · Splits {splits} · Skipped inventory {skipped_inv} · "
+        f"Review {review} · Failed {failed}"
+    )
     if log_path:
         msg += f" · log {log_path.name}"
-    progress(ProgressEvent("done", total, total, msg))
+    progress(ProgressEvent("done", len(plan), len(plan), msg))
     return plan
 
 

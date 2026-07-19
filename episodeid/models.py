@@ -110,6 +110,12 @@ class RenamePlanRow:
     dialogue_lines: list[str] = field(default_factory=list)
     sample_quality: float = 0.0
     track_info: str | None = None
+    # rename = move/rename whole file; split = extract time range from multi-ep source
+    row_kind: str = "rename"  # rename | split | inventory_skip
+    split_start: float | None = None
+    split_end: float | None = None
+    skip_reason: str = ""
+    covered_by: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -129,6 +135,11 @@ class RenamePlanRow:
             "dialogue_lines": list(self.dialogue_lines[:20]),
             "sample_quality": self.sample_quality,
             "track_info": self.track_info,
+            "row_kind": self.row_kind,
+            "split_start": self.split_start,
+            "split_end": self.split_end,
+            "skip_reason": self.skip_reason,
+            "covered_by": self.covered_by,
         }
 
 

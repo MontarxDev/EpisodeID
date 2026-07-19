@@ -205,6 +205,16 @@ class SettingsDialog(QDialog):
         self.skip_samples.setChecked(getattr(self.settings, "skip_sample_folders", True))
         self.auto_resolve = QCheckBox("Auto-resolve duplicates & retry weak matches")
         self.auto_resolve.setChecked(getattr(self.settings, "auto_resolve_problems", True))
+        self.detect_multi = QCheckBox("Detect multi-episode mega files (inventory & split gaps)")
+        self.detect_multi.setChecked(getattr(self.settings, "detect_multi_episode", True))
+        self.skip_split_present = QCheckBox("Skip split if episode already identified in scan")
+        self.skip_split_present.setChecked(
+            getattr(self.settings, "skip_split_if_episode_present", True)
+        )
+        self.skip_split_output = QCheckBox("Skip split if episode already in output library")
+        self.skip_split_output.setChecked(
+            getattr(self.settings, "skip_split_if_in_output_library", True)
+        )
 
         form.addRow("Low confidence threshold", self.low_threshold)
         form.addRow("High confidence threshold", self.auto_threshold)
@@ -216,6 +226,9 @@ class SettingsDialog(QDialog):
         form.addRow(self.recursive)
         form.addRow(self.skip_samples)
         form.addRow(self.auto_resolve)
+        form.addRow(self.detect_multi)
+        form.addRow(self.skip_split_present)
+        form.addRow(self.skip_split_output)
         return w
 
     def _rename_tab(self) -> QWidget:
@@ -380,6 +393,9 @@ class SettingsDialog(QDialog):
         self.settings.recursive_scan = self.recursive.isChecked()
         self.settings.skip_sample_folders = self.skip_samples.isChecked()
         self.settings.auto_resolve_problems = self.auto_resolve.isChecked()
+        self.settings.detect_multi_episode = self.detect_multi.isChecked()
+        self.settings.skip_split_if_episode_present = self.skip_split_present.isChecked()
+        self.settings.skip_split_if_in_output_library = self.skip_split_output.isChecked()
         self.settings.low_threshold = float(self.low_threshold.value())
         self.settings.auto_threshold = float(self.auto_threshold.value())
         self.settings.offset_minutes = float(self.offset.value())

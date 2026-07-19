@@ -9,7 +9,7 @@ from PySide6.QtCore import QObject, QThread, Signal
 from episodeid.config import Settings
 from episodeid.models import Episode, ProgressEvent, RenamePlanRow, SeriesInfo
 from episodeid.pipeline import scan_and_identify
-from episodeid.renamer import apply_renames
+from episodeid.renamer import apply_all_selected
 
 
 class IdentifyWorker(QObject):
@@ -61,7 +61,7 @@ class ApplyWorker(QObject):
 
     def run(self) -> None:
         try:
-            ok, err = apply_renames(self.rows, undo_dir=self.undo_dir)
+            ok, err = apply_all_selected(self.rows, undo_dir=self.undo_dir)
             self.finished.emit(ok, err)
         except Exception as exc:
             self.failed.emit(str(exc))

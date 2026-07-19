@@ -45,6 +45,7 @@ from episodeid.metadata import TMDBClient, TMDBError
 from episodeid.models import ProgressEvent, RenamePlanRow, SeriesInfo
 from episodeid.renamer import (
     DEFAULT_FORMAT,
+    apply_all_selected,
     export_csv,
     export_json,
     format_new_name,
@@ -477,6 +478,16 @@ class MainWindow(QMainWindow):
             self.table.setItem(row_idx, COL_TARGET, tgt_item)
 
             tip_parts = []
+            kind = getattr(row, "row_kind", "rename")
+            tip_parts.append(f"Kind: {kind}")
+            if kind == "split" and row.split_start is not None and row.split_end is not None:
+                tip_parts.append(
+                    f"Split range: {row.split_start/60:.2f}–{row.split_end/60:.2f} min"
+                )
+            if kind == "inventory_skip":
+                tip_parts.append(f"Skip: {row.skip_reason or 'already present'}")
+                if row.covered_by:
+                    tip_parts.append(f"Already have: {row.covered_by}")
             if row.dialogue_source:
                 tip_parts.append(f"Source: {row.dialogue_source}")
             if row.track_info:
@@ -602,14 +613,18 @@ class MainWindow(QMainWindow):
         if not selected:
             QMessageBox.information(self, "Apply", "No rows selected.")
             return
+        n_rename = sum(1 for r in selected if getattr(r, "row_kind", "rename") == "rename")
+        n_split = sum(1 for r in selected if getattr(r, "row_kind", "rename") == "split")
         sample = "\n".join(
             f"{r.original_name} → {r.proposed_name}" for r in selected[:8]
         )
         more = "" if len(selected) <= 8 else f"\n… and {len(selected) - 8} more"
         reply = QMessageBox.question(
             self,
-            "Confirm renames",
-            f"Apply {len(selected)} rename(s)?\n\n{sample}{more}\n\nThis cannot be undone except via Undo last apply.",
+            "Confirm apply",
+            f"Apply {n_rename} rename(s) and {n_split} split(s)?\n"
+            f"Original multi-episode files are kept.\n\n{sample}{more}\n\n"
+            "Undo via Undo last apply (splits remove created files only).",
         )
         if reply != QMessageBox.Yes:
             return

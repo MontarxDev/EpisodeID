@@ -108,6 +108,11 @@ class Settings:
     # Cache location: durable = ~/.local/share/episodeid/cache (recommended)
     durable_cache: bool = True
     rename_in_place: bool = False  # False = Season folders under scan root
+    # Multi-episode mega files
+    detect_multi_episode: bool = True
+    skip_split_if_episode_present: bool = True
+    skip_split_if_in_output_library: bool = True
+    force_splits_even_if_present: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
