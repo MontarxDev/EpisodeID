@@ -228,17 +228,26 @@ def score_dialogue_against_episode(
     if title_toks and title_toks & d_set:
         plot_score += 8.0 * (len(title_toks & d_set) / len(title_toks))
 
-    # Reference SRT path (high weight when available) — the accuracy jump
+    # Reference SRT path — high weight only when sample is substantial.
+    # Stub/empty refs (common for some cache entries) must not beat peers with
+    # full refs via noise; down-weight short ref dialogue.
     ref_score = 0.0
-    if episode.ref_dialogue:
-        ref_score = _ref_dialogue_score(dialogue, episode.ref_dialogue, lines=lines)
-        # Blend: reference dominates when strong
-        if ref_score >= 55:
-            score = 0.72 * ref_score + 0.28 * plot_score
+    ref = (episode.ref_dialogue or "").strip()
+    if ref:
+        ref_score = _ref_dialogue_score(dialogue, ref, lines=lines)
+        ref_len = len(ref)
+        if ref_len < 400:
+            # Stub cache (~508B JSON / tiny sample): barely use ref channel
+            ref_weight = 0.12
+        elif ref_len < 1200:
+            ref_weight = 0.35
+        elif ref_score >= 55:
+            ref_weight = 0.72
         elif ref_score >= 35:
-            score = 0.55 * ref_score + 0.45 * plot_score
+            ref_weight = 0.55
         else:
-            score = 0.30 * ref_score + 0.70 * plot_score
+            ref_weight = 0.30
+        score = ref_weight * ref_score + (1.0 - ref_weight) * plot_score
     else:
         score = plot_score
 
@@ -406,6 +415,127 @@ def demote_duplicate_claims(results: list[MatchResult]) -> list[MatchResult]:
                 result.flags.append("duplicate_claim")
             result.low_confidence = True
     return results
+
+
+def reassign_sequential_disc(
+    results: list[MatchResult],
+    episodes: list[Episode],
+    paths: list[Path],
+    score_matrix: list[list[float]],
+    *,
+    blocked: set[tuple[int, int]] | None = None,
+    order_penalty: float = 20.0,
+    low_threshold: float = 55.0,
+    auto_threshold: float = 70.0,
+) -> list[MatchResult]:
+    """Assign season-disc tracks to free episodes with strong sequential penalty.
+
+    Track order (D1, D2, …) should map to contiguous free episodes (E11–E16),
+    not jump E15→E20. Score is maximized subject to:
+        adjusted = raw_score - order_penalty * |free_index - track_rank|
+
+    Trusted filename rows are pinned and consume their free slot.
+    """
+    from episodeid.renamer import natural_sort_key
+
+    n = len(results)
+    if n == 0 or not episodes or not score_matrix or len(score_matrix) != n:
+        return reassign_unique_episodes(
+            results,
+            episodes,
+            score_matrix=score_matrix,
+            low_threshold=low_threshold,
+            auto_threshold=auto_threshold,
+            blocked=blocked,
+        )
+
+    blocked = set(blocked or set())
+    # Pin trusted first
+    for r in results:
+        if "trusted_filename" in (r.flags or []) and r.season is not None and r.episode is not None:
+            blocked.add((int(r.season), int(r.episode)))
+
+    free_j = sorted(
+        (
+            j
+            for j, ep in enumerate(episodes)
+            if (int(ep.season), int(ep.episode)) not in blocked
+        ),
+        key=lambda j: (episodes[j].season, episodes[j].episode),
+    )
+    if not free_j:
+        return results
+
+    # Files in disc order (exclude trusted from sequential track ranks but still keep them)
+    order = sorted(range(n), key=lambda i: natural_sort_key(paths[i].name if i < len(paths) else str(i)))
+    # Track ranks only among non-trusted assignable rows
+    assignable = [
+        i
+        for i in order
+        if not (
+            "trusted_filename" in (results[i].flags or [])
+            and results[i].season is not None
+        )
+        and not (results[i].error and results[i].sample_quality and results[i].sample_quality < 30)
+    ]
+
+    used_free: set[int] = set()  # indices into free_j list
+    assignment: dict[int, tuple[int, float, bool]] = {}  # file_i -> (ep_j, score, sequential)
+
+    for rank, file_i in enumerate(assignable):
+        best: tuple[float, int, int] | None = None  # adj_score, free_rank, ep_j
+        row = score_matrix[file_i]
+        for fr, ep_j in enumerate(free_j):
+            if fr in used_free:
+                continue
+            if ep_j >= len(row):
+                continue
+            raw = float(row[ep_j])
+            # Allow local ±1 freely; penalize larger jumps hard
+            dist = abs(fr - rank)
+            adj = raw - order_penalty * dist
+            # Soft floor: never consider if raw is garbage unless sequential default
+            if dist == 0:
+                adj += 3.0  # slight preference for pure sequential
+            if best is None or adj > best[0]:
+                best = (adj, fr, ep_j)
+        if best is None:
+            continue
+        _adj, fr, ep_j = best
+        used_free.add(fr)
+        raw = float(score_matrix[file_i][ep_j])
+        sequential = fr == rank
+        assignment[file_i] = (ep_j, raw, sequential)
+
+    for file_i, (ep_j, sc, sequential) in assignment.items():
+        ep = episodes[ep_j]
+        r = results[file_i]
+        r.season = ep.season
+        r.episode = ep.episode
+        r.title = ep.title
+        r.confidence = round(max(0.0, min(100.0, sc)), 1)
+        r.low_confidence = sc < low_threshold
+        r.error = None
+        flags = [
+            f
+            for f in r.flags
+            if f not in {"duplicate_claim", "low_confidence", "review", "no_match"}
+        ]
+        if "assigned_unique" not in flags:
+            flags.append("assigned_unique")
+        if "sequential_disc" not in flags:
+            flags.append("sequential_disc")
+        if sequential and "sequential_prior" not in flags:
+            flags.append("sequential_prior")
+        if sc >= auto_threshold:
+            pass
+        elif sc >= low_threshold:
+            flags.append("review")
+        else:
+            flags.append("low_confidence")
+        r.flags = flags
+
+    return demote_duplicate_claims(results)
 
 
 def reassign_unique_episodes(

@@ -35,6 +35,7 @@ from episodeid.llm import identify_with_llm
 from episodeid.matcher import (
     demote_duplicate_claims,
     match_dialogue,
+    reassign_sequential_disc,
     reassign_unique_episodes,
     score_all_episodes,
 )
@@ -856,17 +857,45 @@ def _scan_one_tree(
             score_matrix,
             episodes,
             blocked=set(precovered.keys()),
+            boost=10.0 if season_hint else 7.0,
         )
 
     progress(ProgressEvent("plan", total_a, total_a, "Resolving unique assignments for singles…"))
-    results = reassign_unique_episodes(
-        results,
-        episodes,
-        score_matrix=score_matrix,
-        low_threshold=settings.low_threshold,
-        auto_threshold=settings.auto_threshold,
-        blocked=set(precovered.keys()),
-    )
+    # Season-locked discs: hard sequential block (prevents E15→E20 jumps)
+    if (
+        season_hint
+        and singles
+        and score_matrix
+        and getattr(settings, "sequential_disc_assign", True)
+        and len(singles) >= 2
+    ):
+        progress(
+            ProgressEvent(
+                "plan",
+                total_a,
+                total_a,
+                f"Sequential disc assign (S{season_hint:02d}, order penalty)…",
+            )
+        )
+        results = reassign_sequential_disc(
+            results,
+            episodes,
+            singles,
+            score_matrix,
+            blocked=set(precovered.keys()),
+            order_penalty=float(getattr(settings, "order_penalty", 20.0)),
+            low_threshold=settings.low_threshold,
+            auto_threshold=settings.auto_threshold,
+        )
+    else:
+        results = reassign_unique_episodes(
+            results,
+            episodes,
+            score_matrix=score_matrix,
+            low_threshold=settings.low_threshold,
+            auto_threshold=settings.auto_threshold,
+            blocked=set(precovered.keys()),
+        )
     results = mark_content_duplicates(results)
     results = demote_duplicate_claims(results)
 

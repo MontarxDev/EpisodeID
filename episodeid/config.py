@@ -120,6 +120,9 @@ class Settings:
     escalate_enabled: bool = True
     escalate_below: float = 80.0  # re-sample when confidence is below this
     max_extra_samples: int = 2  # extra windows after the first (3 total)
+    # Season disc layout: map D1,D2… to consecutive free episodes (no E15→E20 jumps)
+    sequential_disc_assign: bool = True
+    order_penalty: float = 20.0  # score points lost per free-index step away from track order
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
