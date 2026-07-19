@@ -341,8 +341,50 @@ class MainWindow(QMainWindow):
         except Exception:
             system_dark = False
         self._system_dark = system_dark
-        # Default "system" unknown on Mint often → light for readable tables
-        theme = self.settings.theme or "light"
+        # Prefer explicit light for readability; migrate blank/unknown to light
+        theme = (self.settings.theme or "light").strip().lower()
+        if theme not in {"light", "dark", "system"}:
+            theme = "light"
+        # Fusion + light palette avoids Mint dark-chrome fighting our QSS
+        try:
+            from PySide6.QtGui import QPalette, QColor
+            from PySide6.QtWidgets import QStyleFactory
+
+            app.setStyle(QStyleFactory.create("Fusion") or app.style().objectName())
+            if theme == "light" or (theme == "system" and not system_dark):
+                pal = QPalette()
+                page = QColor("#f4f6fa")
+                text = QColor("#1c2333")
+                surface = QColor("#ffffff")
+                pal.setColor(QPalette.Window, page)
+                pal.setColor(QPalette.WindowText, text)
+                pal.setColor(QPalette.Base, surface)
+                pal.setColor(QPalette.AlternateBase, QColor("#f9fafc"))
+                pal.setColor(QPalette.Text, text)
+                pal.setColor(QPalette.Button, surface)
+                pal.setColor(QPalette.ButtonText, text)
+                pal.setColor(QPalette.Highlight, QColor("#e8f0fe"))
+                pal.setColor(QPalette.HighlightedText, text)
+                pal.setColor(QPalette.ToolTipBase, QColor("#1c2333"))
+                pal.setColor(QPalette.ToolTipText, QColor("#ffffff"))
+                app.setPalette(pal)
+            elif theme == "dark" or (theme == "system" and system_dark):
+                pal = QPalette()
+                page = QColor("#2b303b")
+                text = QColor("#f0f2f5")
+                surface = QColor("#353b48")
+                pal.setColor(QPalette.Window, page)
+                pal.setColor(QPalette.WindowText, text)
+                pal.setColor(QPalette.Base, surface)
+                pal.setColor(QPalette.AlternateBase, QColor("#3a4150"))
+                pal.setColor(QPalette.Text, text)
+                pal.setColor(QPalette.Button, surface)
+                pal.setColor(QPalette.ButtonText, text)
+                pal.setColor(QPalette.Highlight, QColor("#3a4f73"))
+                pal.setColor(QPalette.HighlightedText, text)
+                app.setPalette(pal)
+        except Exception:
+            pass
         app.setStyleSheet(stylesheet_for(theme, system_dark=system_dark))
 
     def open_settings(self) -> None:

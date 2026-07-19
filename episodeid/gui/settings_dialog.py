@@ -317,9 +317,16 @@ class SettingsDialog(QDialog):
         install_btn = QPushButton("Install Missing Dependencies (apt)")
         install_btn.clicked.connect(self._install_deps)
         self.theme = QComboBox()
-        self.theme.addItems(["system", "light", "dark"])
-        idx = self.theme.findText(self.settings.theme)
+        self.theme.addItem("Light (recommended)", "light")
+        self.theme.addItem("Dark", "dark")
+        self.theme.addItem("System", "system")
+        cur = (self.settings.theme or "light").strip().lower()
+        idx = self.theme.findData(cur)
         self.theme.setCurrentIndex(max(0, idx))
+        self.theme.setToolTip(
+            "Light is recommended for readable tables and checkboxes. "
+            "Dark uses elevated grays (not pure black)."
+        )
 
         form = QFormLayout()
         form.addRow("Theme", self.theme)
@@ -439,5 +446,5 @@ class SettingsDialog(QDialog):
         self.settings.llm_provider = self.llm_provider.currentText()
         self.settings.llm_model = self.llm_model.text().strip()
         self.settings.ollama_base_url = self.ollama_url.text().strip() or self.settings.ollama_base_url
-        self.settings.theme = self.theme.currentText()
+        self.settings.theme = self.theme.currentData() or "light"
         self.accept()
