@@ -642,17 +642,57 @@ def list_video_files(
 
 
 def season_hint_from_path(path: Path) -> int | None:
-    """If path contains Season 01 / S01 folder, return season number."""
+    """If path contains Season 01 / S01 / S1_D2 / DISC folder season, return number."""
     import re
 
-    for part in path.parts:
-        m = re.search(r"(?i)season[\s._-]*(\d{1,2})", part)
-        if m:
-            return int(m.group(1))
+    # Prefer more specific patterns first across all path parts
+    text_parts = list(path.parts)
+    # Also try full path string for S1_D1 style
+    joined = " ".join(text_parts)
+
+    patterns = [
+        r"(?i)season[\s._-]*(\d{1,2})",
+        r"(?i)(?:^|[^a-z0-9])s(?:eason)?[\s._-]*0*(\d{1,2})(?:[^0-9]|$)",
+        r"(?i)_s(\d{1,2})(?:_|$|d|disc)",
+        r"(?i)(?:^|[^0-9])s(\d{1,2})(?:_d|_disc|d\d|[^0-9]|$)",
+    ]
+    for part in reversed(text_parts):
+        for pat in patterns:
+            m = re.search(pat, part)
+            if m:
+                n = int(m.group(1))
+                if 1 <= n <= 40:
+                    return n
         m = re.fullmatch(r"[Ss](\d{1,2})", part)
         if m:
             return int(m.group(1))
+    for pat in patterns:
+        m = re.search(pat, joined)
+        if m:
+            n = int(m.group(1))
+            if 1 <= n <= 40:
+                return n
     return None
+
+
+def discover_disc_folders(root: Path) -> list[Path]:
+    """Immediate subdirs of root that contain video files (disc dump folders)."""
+    root = Path(root)
+    if not root.is_dir():
+        return []
+    discs: list[Path] = []
+    for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+        if not child.is_dir() or child.name.startswith("."):
+            continue
+        # has any video in tree?
+        found = False
+        for p in child.rglob("*"):
+            if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS:
+                found = True
+                break
+        if found:
+            discs.append(child)
+    return discs
 
 
 def detect_multipart(name: str) -> int | None:

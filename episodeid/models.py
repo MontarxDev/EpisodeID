@@ -117,6 +117,12 @@ class RenamePlanRow:
     skip_reason: str = ""
     covered_by: str = ""
 
+    @property
+    def code(self) -> str | None:
+        if self.season is None or self.episode is None:
+            return None
+        return f"S{self.season:02d}E{self.episode:02d}"
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "path": str(self.path),

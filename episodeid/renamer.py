@@ -150,9 +150,14 @@ def build_plan_row(
         return row
 
     if skip_already_named and is_already_named(original):
+        # Keep identity for covered-set / library, but do not re-rename
         row.selected = False
         row.proposed_name = original
-        row.flags.append("already_named")
+        if "already_named" not in row.flags:
+            row.flags.append("already_named")
+        if "trusted_filename" in result.flags and "trusted_filename" not in row.flags:
+            row.flags.append("trusted_filename")
+        # Ensure S/E preserved from match result
         return row
 
     ext = path.suffix

@@ -78,7 +78,7 @@ class Settings:
     max_lines: int = 40
     size_filter_enabled: bool = True
     size_filter_ratio: float = 0.25
-    skip_already_named: bool = False
+    skip_already_named: bool = True  # trust SxxExx in filename — skip OCR on re-scan
     theme: str = "light"  # light | dark | system — light default for readable tables
     llm_enabled: bool = False
     llm_provider: str = "ollama"  # ollama | gemini | openai | grok
@@ -113,6 +113,9 @@ class Settings:
     skip_split_if_episode_present: bool = True
     skip_split_if_in_output_library: bool = True
     force_splits_even_if_present: bool = False
+    # Full-library helpers
+    auto_season_from_folder: bool = True
+    disc_by_disc_scan: bool = True  # when root has multiple disc folders
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

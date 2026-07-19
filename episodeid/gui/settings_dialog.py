@@ -237,8 +237,12 @@ class SettingsDialog(QDialog):
         self.rename_format = QLineEdit(self.settings.rename_format)
         self.move_season = QCheckBox("Organize into Season XX folders")
         self.move_season.setChecked(self.settings.move_to_season)
-        self.skip_named = QCheckBox("Skip files already named SxxExx")
+        self.skip_named = QCheckBox("Trust already-named SxxExx (skip OCR, don't re-rename)")
         self.skip_named.setChecked(self.settings.skip_already_named)
+        self.skip_named.setToolTip(
+            "Files whose names already contain S01E02 etc. are trusted on re-scan "
+            "(much faster for large libraries)."
+        )
         form.addRow("Rename format", self.rename_format)
         form.addRow(self.move_season)
         form.addRow(self.skip_named)

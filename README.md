@@ -131,14 +131,14 @@ Free path (layered for accuracy):
 
 **Tips for disc rips & big libraries:**
 
-- **Include subfolders** (default on) finds videos in nested Season / disc folders  
-- Settings → Accuracy: TVMaze + reference subs; free Wyzie key; policy **Use cache, download missing**  
-- Settings → **Cache**: durable path (survives reboot), stats, clear TMDB / TVMaze / ref subs  
-- **Match season: Season 01 only** then first scan caches that season’s SRTs (later scans = cache hits only)  
-- **Retry problem rows** re-does only dupes / low-confidence / failed rows  
-- Hover a row for dialogue sample + OCR quality  
-- Scan logs: `~/.local/share/episodeid/scans/`  
-- Durable cache default: `~/.local/share/episodeid/cache/`
+- Point **Scan folder** at `Video Files` (all discs) or one disc; **Output folder** = clean library root  
+- **Include subfolders** + **disc-by-disc** mode (default): processes each disc folder with auto season from names like `S1_D1` / `S7_D2`  
+- Multi-episode megas (`C1`/`A1`/`B1`) are **inventoried**; splits only for episodes **not** already present as singles  
+- **Trust already-named SxxExx** (default): re-scans skip OCR for files already renamed  
+- Settings → Accuracy: TVMaze + Wyzie ref SRTs (cache survives reboot)  
+- Settings → **Cache** tab for clear/open/stats  
+- **Retry problem rows** for weak/dupe rows only  
+- Scan logs: `~/.local/share/episodeid/scans/`
 
 Confidence bands (defaults):
 

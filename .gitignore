@@ -13,3 +13,4 @@ build/
 *.AppImage
 .secrets.json
 *.log
+Video Files/

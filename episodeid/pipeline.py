@@ -15,10 +15,12 @@ from episodeid.edge_cases import (
     season_path_boost,
 )
 from episodeid.extractor import (
+    discover_disc_folders,
     filter_by_size,
     list_video_files,
     probe_duration_seconds,
     sample_dialogue,
+    season_hint_from_path,
 )
 from episodeid.splitter import (
     apply_covered_filter,
@@ -106,14 +108,31 @@ def _process_one_file(
 ) -> tuple[MatchResult, list[float]]:
     """Extract + match one video; returns (result, score_row)."""
     if settings.skip_already_named and is_already_named(path.name):
+        from episodeid.edge_cases import parse_named_episode
+
+        named = parse_named_episode(path.name)
+        season = episode = None
+        title = ""
+        if named:
+            season, episode = named
+            for ep in episodes:
+                if ep.season == season and ep.episode == episode:
+                    title = ep.title
+                    break
         return (
             MatchResult(
                 path=path,
-                error=None,
-                flags=["already_named", "skipped"],
-                dialogue_source="skipped",
+                season=season,
+                episode=episode,
+                title=title or None,
+                confidence=95.0 if named else 0.0,
+                low_confidence=not bool(named),
+                error=None if named else "Already-named but could not parse SxxExx",
+                flags=["already_named", "trusted_filename"] if named else ["already_named"],
+                dialogue_source="filename",
                 sample_quality=100.0,
             ),
+            # Zero scores so unique reassignment does not steal trusted names
             [0.0] * len(episodes),
         )
 
@@ -314,10 +333,77 @@ def scan_and_identify(
         client = TMDBClient(api_key)
         episodes = client.get_all_episodes(series.id)
 
+    if getattr(settings, "use_tvmaze", True):
+        progress(ProgressEvent("metadata", 0, 1, "Enriching episode plots via TVMaze (free)…"))
+        try:
+            episodes = enrich_episodes_with_tvmaze(list(episodes), series.name)
+        except Exception as exc:
+            progress(ProgressEvent("metadata", 0, 1, f"TVMaze skipped: {exc}"))
+
+    all_episodes = list(episodes)
+
+    # Disc-by-disc when scanning a parent of many disc folders
+    discs = discover_disc_folders(folder)
+    use_disc_mode = (
+        getattr(settings, "disc_by_disc_scan", True)
+        and len(discs) >= 2
+        and not (getattr(settings, "season_filter", None) or 0)
+    )
+    if use_disc_mode:
+        progress(
+            ProgressEvent(
+                "scan",
+                0,
+                len(discs),
+                f"Full library mode: {len(discs)} disc folders — processing one disc at a time",
+            )
+        )
+        combined: list[RenamePlanRow] = []
+        for di, disc in enumerate(discs, start=1):
+            if cancel_check():
+                break
+            season_hint = (
+                season_hint_from_path(disc)
+                if getattr(settings, "auto_season_from_folder", True)
+                else None
+            )
+            label = f"Disc {di}/{len(discs)}: {disc.name}"
+            if season_hint:
+                label += f" (auto S{season_hint:02d})"
+            progress(ProgressEvent("scan", di, len(discs), label))
+            disc_eps = all_episodes
+            if season_hint:
+                disc_eps = [e for e in all_episodes if e.season == season_hint]
+                if not disc_eps:
+                    disc_eps = all_episodes
+            part = _scan_one_tree(
+                folder=disc,
+                series=series,
+                episodes=disc_eps,
+                all_series_episodes=all_episodes,
+                settings=settings,
+                progress=progress,
+                cancel_check=cancel_check,
+                season_hint=season_hint,
+                library_root=folder,
+            )
+            combined.extend(part)
+        progress(
+            ProgressEvent(
+                "done",
+                len(discs),
+                len(discs),
+                f"All discs done — {len(combined)} plan row(s)",
+            )
+        )
+        return combined
+
+    # Single folder / explicit season filter path
     season_filter = getattr(settings, "season_filter", None) or None
+    season_hint = None
     if season_filter and int(season_filter) > 0:
         sf = int(season_filter)
-        episodes = [e for e in episodes if e.season == sf]
+        episodes = [e for e in all_episodes if e.season == sf]
         progress(
             ProgressEvent(
                 "metadata",
@@ -328,40 +414,85 @@ def scan_and_identify(
         )
         if not episodes:
             raise ValueError(f"No episodes found for season {sf}")
+    elif getattr(settings, "auto_season_from_folder", True):
+        season_hint = season_hint_from_path(folder)
+        if season_hint:
+            episodes = [e for e in all_episodes if e.season == season_hint]
+            if episodes:
+                progress(
+                    ProgressEvent(
+                        "metadata",
+                        0,
+                        1,
+                        f"Auto season from folder: S{season_hint:02d} ({len(episodes)} episodes)",
+                    )
+                )
+            else:
+                episodes = all_episodes
+                season_hint = None
+        else:
+            episodes = all_episodes
+    else:
+        episodes = all_episodes
 
-    if getattr(settings, "use_tvmaze", True):
-        progress(ProgressEvent("metadata", 0, 1, "Enriching episode plots via TVMaze (free)…"))
-        try:
-            episodes = enrich_episodes_with_tvmaze(episodes, series.name)
-        except Exception as exc:
-            progress(ProgressEvent("metadata", 0, 1, f"TVMaze skipped: {exc}"))
+    return _scan_one_tree(
+        folder=folder,
+        series=series,
+        episodes=episodes,
+        all_series_episodes=all_episodes,
+        settings=settings,
+        progress=progress,
+        cancel_check=cancel_check,
+        season_hint=season_hint,
+        library_root=folder,
+    )
 
-    if getattr(settings, "use_reference_subs", True):
-        wyzie_key = get_secret(KEY_WYZIE)
-        policy = getattr(settings, "refsubs_network_policy", "download-missing") or "download-missing"
-        save_cache = getattr(settings, "save_refsubs_to_cache", True)
-        progress(
-            ProgressEvent(
-                "metadata",
-                0,
-                1,
-                f"Reference subtitles (policy={policy})…",
-            )
+
+def _attach_refs_for_episodes(
+    episodes: list[Episode],
+    series: SeriesInfo,
+    settings: Settings,
+    progress: ProgressCb,
+) -> None:
+    if not getattr(settings, "use_reference_subs", True):
+        return
+    wyzie_key = get_secret(KEY_WYZIE)
+    policy = getattr(settings, "refsubs_network_policy", "download-missing") or "download-missing"
+    save_cache = getattr(settings, "save_refsubs_to_cache", True)
+    progress(
+        ProgressEvent("metadata", 0, 1, f"Reference subtitles (policy={policy})…")
+    )
+    try:
+        # When season-scoped, fetch all episodes in that list
+        max_eps = max(len(episodes), 40)
+        stats = attach_reference_subs(
+            episodes,
+            series.id,
+            api_key=wyzie_key,
+            max_episodes=max_eps,
+            progress=lambda m: progress(ProgressEvent("metadata", 0, 1, m)),
+            policy=policy,
+            save_to_cache=save_cache,
         )
-        try:
-            max_eps = 80 if season_filter else 30
-            stats = attach_reference_subs(
-                episodes,
-                series.id,
-                api_key=wyzie_key,
-                max_episodes=max_eps,
-                progress=lambda m: progress(ProgressEvent("metadata", 0, 1, m)),
-                policy=policy,
-                save_to_cache=save_cache,
-            )
-            progress(ProgressEvent("metadata", 0, 1, stats.summary()))
-        except Exception as exc:
-            progress(ProgressEvent("metadata", 0, 1, f"Reference subs skipped: {exc}"))
+        progress(ProgressEvent("metadata", 0, 1, stats.summary()))
+    except Exception as exc:
+        progress(ProgressEvent("metadata", 0, 1, f"Reference subs skipped: {exc}"))
+
+
+def _scan_one_tree(
+    *,
+    folder: Path,
+    series: SeriesInfo,
+    episodes: list[Episode],
+    all_series_episodes: list[Episode],
+    settings: Settings,
+    progress: ProgressCb,
+    cancel_check: Callable[[], bool],
+    season_hint: int | None,
+    library_root: Path,
+) -> list[RenamePlanRow]:
+    """Pass A/B scan for one disc folder or single tree."""
+    _attach_refs_for_episodes(episodes, series, settings, progress)
 
     recursive = getattr(settings, "recursive_scan", True)
     skip_samples = getattr(settings, "skip_sample_folders", True)
@@ -469,11 +600,12 @@ def scan_and_identify(
         results = _second_pass_resolve(results, score_matrix, episodes, settings)
         results = demote_duplicate_claims(results)
 
-    output_root = _resolve_output_root(folder, settings)
+    # Output library is based on the user's scan root (full library), not each disc subfolder
+    output_root = _resolve_output_root(library_root, settings)
     plan = build_plan(
         results,
         series_name=series.name,
-        scan_root=folder,
+        scan_root=library_root,
         move_to_season=settings.move_to_season and not getattr(settings, "rename_in_place", False),
         fmt=settings.rename_format,
         low_threshold=settings.low_threshold,
@@ -545,24 +677,60 @@ def scan_and_identify(
                 )
             )
             segs = inventory_segments(mpath, expected_runtime_min=med_rt)
-            for si, seg in enumerate(segs, start=1):
+            # Fast path: this disc already has as many good singles as segments → no need to split mega
+            disc_root = mpath.parent
+            disc_singles = 0
+            try:
+                disc_root_s = str(disc_root.resolve())
+            except OSError:
+                disc_root_s = str(disc_root)
+            for row in plan:
+                if row.season is None or row.confidence < settings.low_threshold:
+                    continue
+                try:
+                    if str(Path(row.path).resolve()).startswith(disc_root_s + "/") or str(
+                        Path(row.path).resolve()
+                    ).startswith(disc_root_s):
+                        # count files under same disc folder tree
+                        rp = str(Path(row.path).resolve())
+                        if rp == disc_root_s or rp.startswith(disc_root_s + "/"):
+                            disc_singles += 1
+                except OSError:
+                    continue
+
+            if skip_covered and segs and disc_singles >= len(segs):
                 progress(
                     ProgressEvent(
-                        "match",
-                        si,
-                        len(segs),
-                        f"Identify segment {si}/{len(segs)} in {mpath.name} "
-                        f"({seg.start/60:.1f}–{seg.end/60:.1f}m)",
-                        path=str(mpath),
+                        "plan",
+                        0,
+                        1,
+                        f"Skip mega {mpath.name}: disc already has {disc_singles} "
+                        f"episode file(s) ≥ {len(segs)} segment(s)",
                     )
                 )
-                identify_segment(
-                    seg,
-                    episodes,
-                    low_threshold=settings.low_threshold,
-                    auto_threshold=settings.auto_threshold,
-                )
-            segs = apply_covered_filter(segs, covered, skip_if_covered=skip_covered)
+                for seg in segs:
+                    seg.skip = True
+                    seg.skip_reason = "disc_has_enough_singles"
+                    seg.flags.append("skip_disc_complete")
+            else:
+                for si, seg in enumerate(segs, start=1):
+                    progress(
+                        ProgressEvent(
+                            "match",
+                            si,
+                            len(segs),
+                            f"Identify segment {si}/{len(segs)} in {mpath.name} "
+                            f"({seg.start/60:.1f}–{seg.end/60:.1f}m)",
+                            path=str(mpath),
+                        )
+                    )
+                    identify_segment(
+                        seg,
+                        episodes,
+                        low_threshold=settings.low_threshold,
+                        auto_threshold=settings.auto_threshold,
+                    )
+                segs = apply_covered_filter(segs, covered, skip_if_covered=skip_covered)
 
             for seg in segs:
                 proposed = ""
@@ -580,7 +748,7 @@ def scan_and_identify(
                     )
                     target = resolve_target_dir(
                         season=seg.season if settings.move_to_season else None,
-                        scan_root=folder,
+                        scan_root=library_root,
                         output_root=output_root,
                         series_name=series.name,
                         move_to_season=settings.move_to_season,
@@ -596,12 +764,19 @@ def scan_and_identify(
                     flags = list(seg.flags) + ["inventory_skip"]
                 else:
                     kind = "split"
+                    # Stricter than renames: avoid bad plot-only IDs creating junk files
                     selected = (
                         seg.season is not None
                         and not seg.error
-                        and seg.confidence >= settings.low_threshold
+                        and seg.confidence >= settings.auto_threshold
                     )
                     flags = list(seg.flags) + ["split_segment"]
+                    if (
+                        seg.season is not None
+                        and not seg.error
+                        and settings.low_threshold <= seg.confidence < settings.auto_threshold
+                    ):
+                        flags.append("review")
 
                 # Mark covered so later megas don't re-propose
                 if selected and seg.season is not None and seg.episode is not None:
