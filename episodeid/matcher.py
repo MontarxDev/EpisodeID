@@ -417,6 +417,114 @@ def demote_duplicate_claims(results: list[MatchResult]) -> list[MatchResult]:
     return results
 
 
+def _track_letter_prefix(name: str) -> str | None:
+    """Leading letter class for DVD dumps: D1_t01 → D, E4_t04 → E, C1_t01 → C."""
+    m = re.match(r"^([A-Za-z]+)\d", name or "")
+    return m.group(1).upper() if m else None
+
+
+def filter_sequential_track_indices(
+    paths: list[Path],
+    results: list[MatchResult],
+    ordered_idx: list[int],
+) -> list[int]:
+    """Keep main episode tracks; drop lone outliers that steal rank 0 (e.g. D1_t08 among E*)."""
+    candidates: list[int] = []
+    for i in ordered_idx:
+        r = results[i]
+        if "trusted_filename" in (r.flags or []) and r.season is not None:
+            continue
+        if r.error and (r.sample_quality or 0) < 30:
+            continue
+        if "likely_extra" in (r.flags or []):
+            continue
+        candidates.append(i)
+    if len(candidates) < 2:
+        return candidates
+
+    # Majority letter prefix among candidates (E vs D vs C)
+    letters = [_track_letter_prefix(paths[i].name if i < len(paths) else "") for i in candidates]
+    from collections import Counter
+
+    counts = Counter(L for L in letters if L)
+    if not counts:
+        return candidates
+    majority, maj_n = counts.most_common(1)[0]
+    # If clear majority (≥ half), drop other prefixes (D1_t08 among E1–E6)
+    if maj_n >= max(2, (len(candidates) + 1) // 2):
+        filtered = [
+            i
+            for i, L in zip(candidates, letters)
+            if L == majority or L is None
+        ]
+        if len(filtered) >= 2:
+            return filtered
+    return candidates
+
+
+def contiguous_episode_runs(
+    free_j: list[int],
+    episodes: list[Episode],
+) -> list[list[int]]:
+    """Group free catalog indices into contiguous episode-number runs (same season)."""
+    if not free_j:
+        return []
+    runs: list[list[int]] = []
+    cur = [free_j[0]]
+    for j in free_j[1:]:
+        prev = episodes[cur[-1]]
+        ep = episodes[j]
+        if ep.season == prev.season and ep.episode == prev.episode + 1:
+            cur.append(j)
+        else:
+            runs.append(cur)
+            cur = [j]
+    runs.append(cur)
+    return runs
+
+
+def pick_primary_free_block(
+    free_j: list[int],
+    episodes: list[Episode],
+    n_tracks: int,
+) -> list[int]:
+    """Choose a contiguous free block sized for n_tracks (prefer longest suitable run).
+
+    Avoids gappy free lists like [E05, E16..E20] mapping track0→E05, track1→E16.
+    Orphans (runs of length 1 while a long block exists) are left for a later pass.
+    """
+    if not free_j or n_tracks <= 0:
+        return []
+    runs = contiguous_episode_runs(free_j, episodes)
+    if not runs:
+        return free_j[:n_tracks]
+
+    # Prefer runs that can host n_tracks, then longest, then earliest episode
+    def run_key(run: list[int]) -> tuple:
+        ep0 = episodes[run[0]]
+        fits = 1 if len(run) >= n_tracks else 0
+        return (fits, len(run), -ep0.season, -ep0.episode)
+
+    runs_sorted = sorted(runs, key=run_key, reverse=True)
+    primary = runs_sorted[0]
+    if len(primary) >= n_tracks:
+        return primary[:n_tracks]
+    # Not enough in one run: take longest then append next best contiguous pieces
+    block = list(primary)
+    for run in runs_sorted[1:]:
+        if len(block) >= n_tracks:
+            break
+        # Only append if adjacent to block end
+        last = episodes[block[-1]]
+        first = episodes[run[0]]
+        if first.season == last.season and first.episode == last.episode + 1:
+            block.extend(run)
+        elif len(run) > len(block) and len(block) < n_tracks // 2:
+            # Switch to clearly better late block (orphan early hole vs long run)
+            block = list(run)
+    return block[:n_tracks] if block else free_j[:n_tracks]
+
+
 def reassign_sequential_disc(
     results: list[MatchResult],
     episodes: list[Episode],
@@ -428,13 +536,12 @@ def reassign_sequential_disc(
     low_threshold: float = 55.0,
     auto_threshold: float = 70.0,
 ) -> list[MatchResult]:
-    """Assign season-disc tracks to free episodes with strong sequential penalty.
+    """Assign season-disc tracks to a contiguous free episode block.
 
-    Track order (D1, D2, …) should map to contiguous free episodes (E11–E16),
-    not jump E15→E20. Score is maximized subject to:
-        adjusted = raw_score - order_penalty * |free_index - track_rank|
-
-    Trusted filename rows are pinned and consume their free slot.
+    - Drops outlier tracks (e.g. D1_t08 among E* rips) from ranking.
+    - Uses longest contiguous free run (not gappy free list).
+    - Only allows ±1 slot deviation unless sequential score is terrible.
+    - Blends dialogue conf with layout conf for sequential_prior rows.
     """
     from episodeid.renamer import natural_sort_key
 
@@ -450,12 +557,11 @@ def reassign_sequential_disc(
         )
 
     blocked = set(blocked or set())
-    # Pin trusted first
     for r in results:
         if "trusted_filename" in (r.flags or []) and r.season is not None and r.episode is not None:
             blocked.add((int(r.season), int(r.episode)))
 
-    free_j = sorted(
+    free_j_all = sorted(
         (
             j
             for j, ep in enumerate(episodes)
@@ -463,49 +569,101 @@ def reassign_sequential_disc(
         ),
         key=lambda j: (episodes[j].season, episodes[j].episode),
     )
-    if not free_j:
+    if not free_j_all:
         return results
 
-    # Files in disc order (exclude trusted from sequential track ranks but still keep them)
-    order = sorted(range(n), key=lambda i: natural_sort_key(paths[i].name if i < len(paths) else str(i)))
-    # Track ranks only among non-trusted assignable rows
-    assignable = [
-        i
-        for i in order
-        if not (
-            "trusted_filename" in (results[i].flags or [])
-            and results[i].season is not None
+    order = sorted(
+        range(n),
+        key=lambda i: natural_sort_key(paths[i].name if i < len(paths) else str(i)),
+    )
+    assignable = filter_sequential_track_indices(paths, results, order)
+    if len(assignable) < 2:
+        return reassign_unique_episodes(
+            results,
+            episodes,
+            score_matrix=score_matrix,
+            low_threshold=low_threshold,
+            auto_threshold=auto_threshold,
+            blocked=blocked,
         )
-        and not (results[i].error and results[i].sample_quality and results[i].sample_quality < 30)
-    ]
 
-    used_free: set[int] = set()  # indices into free_j list
-    assignment: dict[int, tuple[int, float, bool]] = {}  # file_i -> (ep_j, score, sequential)
+    # Contiguous block of free episodes for these tracks
+    target_block = pick_primary_free_block(free_j_all, episodes, len(assignable))
+    if not target_block:
+        target_block = free_j_all[: len(assignable)]
+
+    used_block: set[int] = set()  # indices into target_block
+    assignment: dict[int, tuple[int, float, bool]] = {}
 
     for rank, file_i in enumerate(assignable):
-        best: tuple[float, int, int] | None = None  # adj_score, free_rank, ep_j
         row = score_matrix[file_i]
-        for fr, ep_j in enumerate(free_j):
-            if fr in used_free:
+        best: tuple[float, int, int] | None = None  # adj, block_rank, ep_j
+
+        # Candidate block ranks: prefer rank, allow ±1 only (strict)
+        cand_ranks = [rank]
+        if rank - 1 >= 0:
+            cand_ranks.append(rank - 1)
+        if rank + 1 < len(target_block):
+            cand_ranks.append(rank + 1)
+
+        for br in cand_ranks:
+            if br in used_block or br >= len(target_block):
                 continue
+            ep_j = target_block[br]
             if ep_j >= len(row):
                 continue
             raw = float(row[ep_j])
-            # Allow local ±1 freely; penalize larger jumps hard
-            dist = abs(fr - rank)
+            dist = abs(br - rank)
             adj = raw - order_penalty * dist
-            # Soft floor: never consider if raw is garbage unless sequential default
             if dist == 0:
-                adj += 3.0  # slight preference for pure sequential
+                adj += 5.0
             if best is None or adj > best[0]:
-                best = (adj, fr, ep_j)
+                best = (adj, br, ep_j)
+
+        # Escape hatch: only if sequential slot is very weak, allow best in whole block
+        if best is not None:
+            seq_br = rank if rank < len(target_block) else len(target_block) - 1
+            if seq_br not in used_block and seq_br < len(target_block):
+                seq_j = target_block[seq_br]
+                seq_raw = float(row[seq_j]) if seq_j < len(row) else 0.0
+                if seq_raw < 40.0:
+                    for br, ep_j in enumerate(target_block):
+                        if br in used_block:
+                            continue
+                        raw = float(row[ep_j]) if ep_j < len(row) else 0.0
+                        if raw >= seq_raw + 25.0:
+                            adj = raw - order_penalty * abs(br - rank)
+                            if best is None or adj > best[0]:
+                                best = (adj, br, ep_j)
+
         if best is None:
             continue
-        _adj, fr, ep_j = best
-        used_free.add(fr)
+        _adj, br, ep_j = best
+        used_block.add(br)
         raw = float(score_matrix[file_i][ep_j])
-        sequential = fr == rank
+        sequential = br == rank
         assignment[file_i] = (ep_j, raw, sequential)
+
+    # Hole repair: if assignments skip one episode inside the block, slide later ones
+    # Build list of (rank, file_i, ep_num)
+    assigned_list = []
+    for rank, file_i in enumerate(assignable):
+        if file_i not in assignment:
+            continue
+        ep_j, sc, seq = assignment[file_i]
+        assigned_list.append((rank, file_i, episodes[ep_j].episode, ep_j, sc, seq))
+    # If we have a clean block start but a hole (e.g. E01-E04 then E06), force re-map ranks to block
+    if len(assignment) == len(assignable) and len(target_block) >= len(assignable):
+        # Force pure sequential onto target_block when most ranks already sequential
+        n_seq = sum(1 for _r, _f, _e, _j, _s, seq in assigned_list if seq)
+        if n_seq >= max(2, len(assignable) - 2):
+            # Re-bind strictly: file rank i → target_block[i]
+            for rank, file_i in enumerate(assignable):
+                if rank >= len(target_block):
+                    break
+                ep_j = target_block[rank]
+                raw = float(score_matrix[file_i][ep_j]) if ep_j < len(score_matrix[file_i]) else 50.0
+                assignment[file_i] = (ep_j, raw, True)
 
     for file_i, (ep_j, sc, sequential) in assignment.items():
         ep = episodes[ep_j]
@@ -513,8 +671,16 @@ def reassign_sequential_disc(
         r.season = ep.season
         r.episode = ep.episode
         r.title = ep.title
-        r.confidence = round(max(0.0, min(100.0, sc)), 1)
-        r.low_confidence = sc < low_threshold
+        dialogue_conf = max(0.0, min(100.0, float(sc)))
+        # Layout confidence: sequential slots are layout-strong
+        layout_conf = 88.0 if sequential else 78.0
+        # Blend so forced sequential doesn't look like random ~55 when dialogue is weak
+        if sequential:
+            blended = 0.55 * dialogue_conf + 0.45 * layout_conf
+        else:
+            blended = 0.70 * dialogue_conf + 0.30 * layout_conf
+        r.confidence = round(max(0.0, min(100.0, blended)), 1)
+        r.low_confidence = dialogue_conf < low_threshold
         r.error = None
         flags = [
             f
@@ -527,13 +693,21 @@ def reassign_sequential_disc(
             flags.append("sequential_disc")
         if sequential and "sequential_prior" not in flags:
             flags.append("sequential_prior")
-        if sc >= auto_threshold:
-            pass
-        elif sc >= low_threshold:
+        # Select: layout-backed sequential can be selected even if dialogue mid
+        if dialogue_conf >= auto_threshold or (sequential and dialogue_conf >= 45):
+            pass  # will select via build_plan thresholds using blended conf
+        if dialogue_conf < low_threshold and sequential:
             flags.append("review")
-        else:
+        elif blended < auto_threshold and blended >= low_threshold:
+            flags.append("review")
+        elif blended < low_threshold:
             flags.append("low_confidence")
         r.flags = flags
+        # Stash dialogue-only conf for tooltips via track_info suffix if empty
+        if r.track_info and "dlg=" not in (r.track_info or ""):
+            r.track_info = f"{r.track_info} dlg={dialogue_conf:.0f}"
+        elif not r.track_info:
+            r.track_info = f"dlg={dialogue_conf:.0f}"
 
     return demote_duplicate_claims(results)
 
