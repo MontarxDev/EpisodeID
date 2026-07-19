@@ -498,21 +498,56 @@ def scan_and_identify(
 
     all_episodes = list(episodes)
     output_root = _resolve_output_root(folder, settings)
+    season_filter_n = getattr(settings, "season_filter", None) or None
+    if season_filter_n:
+        try:
+            season_filter_n = int(season_filter_n)
+        except (TypeError, ValueError):
+            season_filter_n = None
+        if season_filter_n is not None and season_filter_n <= 0:
+            season_filter_n = None
 
-    # Disc-by-disc when scanning a parent of many disc folders
+    # Disc-by-disc when scanning a parent of many disc folders.
+    # Season filter keeps disc-by-disc: it only limits which disc folders run.
     discs = discover_disc_folders(folder)
+    if season_filter_n and discs:
+        filtered_discs = [
+            d
+            for d in discs
+            if season_hint_from_path(d) == season_filter_n
+        ]
+        if filtered_discs:
+            slog.log(
+                "season_filter",
+                f"Season filter S{season_filter_n:02d}: "
+                f"{len(filtered_discs)}/{len(discs)} disc folders",
+                season=season_filter_n,
+                discs=[d.name for d in filtered_discs],
+            )
+            discs = filtered_discs
+        else:
+            slog.log(
+                "season_filter",
+                f"Season filter S{season_filter_n:02d}: no disc folders matched "
+                f"season hint — falling back to single-tree scan",
+                season=season_filter_n,
+            )
+            discs = []
+
     use_disc_mode = (
         getattr(settings, "disc_by_disc_scan", True)
         and len(discs) >= 2
-        and not (getattr(settings, "season_filter", None) or 0)
     )
     if use_disc_mode:
+        mode_label = f"{len(discs)} disc folders"
+        if season_filter_n:
+            mode_label = f"S{season_filter_n:02d} only · {mode_label}"
         _progress(
             ProgressEvent(
                 "scan",
                 0,
                 len(discs),
-                f"Full library mode: {len(discs)} disc folders — processing one disc at a time",
+                f"Disc-by-disc mode: {mode_label} — processing one disc at a time",
             )
         )
         combined: list[RenamePlanRow] = []
@@ -525,6 +560,17 @@ def scan_and_identify(
 
                 lib_root = output_root / sanitize_filename(series.name)
             library_covered.update(_scan_lib_eps(lib_root))
+            # Season-only runs should not treat other seasons' output as blocking free slots
+            if season_filter_n:
+                library_covered = {
+                    k: v
+                    for k, v in library_covered.items()
+                    if k[0] == season_filter_n
+                }
+
+        coverage_catalog = all_episodes
+        if season_filter_n:
+            coverage_catalog = [e for e in all_episodes if e.season == season_filter_n] or all_episodes
 
         for di, disc in enumerate(discs, start=1):
             if cancel_check():
@@ -534,6 +580,8 @@ def scan_and_identify(
                 if getattr(settings, "auto_season_from_folder", True)
                 else None
             )
+            if season_filter_n and season_hint is None:
+                season_hint = season_filter_n
             label = f"Disc {di}/{len(discs)}: {disc.name}"
             if season_hint:
                 label += f" (auto S{season_hint:02d})"
@@ -577,7 +625,7 @@ def scan_and_identify(
         )
         combined = finalize_plan_rows(
             combined,
-            catalog=all_episodes,
+            catalog=coverage_catalog,
             low_threshold=settings.low_threshold,
             auto_threshold=settings.auto_threshold,
             series_name=series.name,
@@ -585,7 +633,7 @@ def scan_and_identify(
         counts = plan_summary_counts(combined)
         _, cov_summary, cov_dicts = _compute_coverage(
             combined,
-            all_episodes,
+            coverage_catalog,
             settings=settings,
             series=series,
             output_root=output_root,
@@ -607,6 +655,7 @@ def scan_and_identify(
             extra={
                 "mode": "disc_by_disc",
                 "disc_count": len(discs),
+                "season_filter": season_filter_n,
                 "counts": counts,
                 "coverage": cov_dicts,
                 "coverage_summary": cov_summary,
@@ -615,8 +664,8 @@ def scan_and_identify(
         _progress(ProgressEvent("done", len(combined), len(combined), f"Review log: {md}"))
         return combined
 
-    # Single folder / explicit season filter path
-    season_filter = getattr(settings, "season_filter", None) or None
+    # Single folder / no multi-disc layout path
+    season_filter = season_filter_n
     season_hint = None
     if season_filter and int(season_filter) > 0:
         sf = int(season_filter)

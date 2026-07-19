@@ -37,3 +37,16 @@ def test_discover_disc_folders(tmp_path: Path):
     names = {p.name for p in discs}
     assert names == {"SHOW_S1_D1", "SHOW_S2_D1"}
     assert empty.name not in names
+
+
+def test_season_filter_keeps_matching_discs_only(tmp_path: Path):
+    """Season filter must select S5 discs without leaving disc-by-disc mode."""
+    for name in ("SHOW_S4_D1", "SHOW_S5_D1", "SHOW_S5_D2", "SHOW_S5_D3", "SHOW_S6_D1"):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "C1_t01.mkv").write_bytes(b"x")
+    discs = discover_disc_folders(tmp_path)
+    s5 = [d for d in discs if season_hint_from_path(d) == 5]
+    assert [d.name for d in s5] == ["SHOW_S5_D1", "SHOW_S5_D2", "SHOW_S5_D3"]
+    # Still multi-disc → disc-by-disc eligible
+    assert len(s5) >= 2

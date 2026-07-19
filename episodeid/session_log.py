@@ -26,6 +26,58 @@ def sessions_root() -> Path:
     return data_dir() / "sessions"
 
 
+def _build_provenance() -> dict[str, Any]:
+    """Identify which binary / matcher logic produced a session (debug AppImage lag)."""
+    import hashlib
+    import inspect
+    import os
+    import sys
+
+    prov: dict[str, Any] = {
+        "python": sys.version.split()[0],
+        "executable": sys.executable,
+        "appimage": bool(os.environ.get("APPIMAGE") or os.environ.get("APPDIR")),
+    }
+    if os.environ.get("APPIMAGE"):
+        prov["appimage_path"] = os.environ.get("APPIMAGE")
+    try:
+        from episodeid import __version__
+
+        prov["version"] = __version__
+    except Exception:
+        prov["version"] = "unknown"
+    try:
+        from episodeid import matcher as matcher_mod
+
+        src = inspect.getsource(matcher_mod.reassign_sequential_disc)
+        prov["matcher_sha12"] = hashlib.sha256(src.encode()).hexdigest()[:12]
+        prov["sequential_mode"] = (
+            "strict"
+            if "STRICT sequential" in src and "cand_ranks" not in src
+            else "soft_pm1"
+            if "cand_ranks" in src
+            else "unknown"
+        )
+        prov["matcher_file"] = getattr(matcher_mod, "__file__", None)
+    except Exception as exc:
+        prov["matcher_error"] = str(exc)
+    try:
+        import subprocess
+
+        root = Path(__file__).resolve().parents[1]
+        r = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if r.returncode == 0:
+            prov["git_head"] = r.stdout.strip()
+    except Exception:
+        pass
+    return prov
+
+
 class SessionLog:
     def __init__(self, label: str = "scan"):
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -93,7 +145,13 @@ class SessionLog:
         try:
             data = settings.to_dict() if hasattr(settings, "to_dict") else asdict(settings) if is_dataclass(settings) else {}
             # never write secrets
+            data["_provenance"] = _build_provenance()
             self.settings_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            self.log(
+                "provenance",
+                "Binary / package provenance",
+                **data["_provenance"],
+            )
         except Exception as exc:
             self.log("warn", f"Could not snapshot settings: {exc}")
 
