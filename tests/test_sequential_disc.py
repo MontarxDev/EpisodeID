@@ -121,7 +121,22 @@ def test_blended_conf_raises_weak_sequential():
     for i in range(3):
         matrix[i][i] = 50.0  # exact sequential weak dialogue
     out = reassign_sequential_disc(results, episodes, paths, matrix)
-    # blended 0.55*50 + 0.45*88 ≈ 67
+    # blended 0.50*50 + 0.50*90 = 70
     assert out[0].episode == 1
-    assert out[0].confidence >= 60
+    assert out[0].confidence >= 65
     assert "sequential_prior" in out[0].flags
+
+
+def test_strict_no_skip_e05_in_seven_track_block():
+    """S5_D1 regression: 7 tracks must get E01–E07, never skip E05."""
+    episodes = _eps(1, 20)
+    paths = [Path(f"C{i}_t0{i}.mkv") for i in range(1, 8)]
+    results = [MatchResult(path=p, sample_quality=90) for p in paths]
+    # Bias scores so E06 looks better than E05 for track 5 — strict layout must ignore
+    matrix = [[40.0] * len(episodes) for _ in paths]
+    for i in range(7):
+        matrix[i][i] = 70.0  # E01..E07 diagonal
+    matrix[4][4] = 45.0  # E05 weak
+    matrix[4][5] = 95.0  # E06 strong for C5
+    out = reassign_sequential_disc(results, episodes, paths, matrix, order_penalty=20.0)
+    assert [r.episode for r in out] == list(range(1, 8))

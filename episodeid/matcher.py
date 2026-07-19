@@ -587,83 +587,34 @@ def reassign_sequential_disc(
             blocked=blocked,
         )
 
-    # Contiguous block of free episodes for these tracks
+    # Contiguous free block sized for main tracks (show-agnostic layout)
     target_block = pick_primary_free_block(free_j_all, episodes, len(assignable))
     if not target_block:
         target_block = free_j_all[: len(assignable)]
 
-    used_block: set[int] = set()  # indices into target_block
+    # STRICT sequential: track rank i → target_block[i].
+    # Dialogue only affects confidence — never open mid-block holes (E04→E06).
     assignment: dict[int, tuple[int, float, bool]] = {}
-
+    claimed_ep_j: set[int] = set()
     for rank, file_i in enumerate(assignable):
         row = score_matrix[file_i]
-        best: tuple[float, int, int] | None = None  # adj, block_rank, ep_j
-
-        # Candidate block ranks: prefer rank, allow ±1 only (strict)
-        cand_ranks = [rank]
-        if rank - 1 >= 0:
-            cand_ranks.append(rank - 1)
-        if rank + 1 < len(target_block):
-            cand_ranks.append(rank + 1)
-
-        for br in cand_ranks:
-            if br in used_block or br >= len(target_block):
+        if rank < len(target_block):
+            ep_j = target_block[rank]
+            raw = float(row[ep_j]) if ep_j < len(row) else 50.0
+            sequential = True
+        else:
+            # More tracks than primary block: best remaining free (orphans)
+            leftovers = [j for j in free_j_all if j not in claimed_ep_j]
+            if not leftovers:
                 continue
-            ep_j = target_block[br]
-            if ep_j >= len(row):
-                continue
-            raw = float(row[ep_j])
-            dist = abs(br - rank)
-            adj = raw - order_penalty * dist
-            if dist == 0:
-                adj += 5.0
-            if best is None or adj > best[0]:
-                best = (adj, br, ep_j)
-
-        # Escape hatch: only if sequential slot is very weak, allow best in whole block
-        if best is not None:
-            seq_br = rank if rank < len(target_block) else len(target_block) - 1
-            if seq_br not in used_block and seq_br < len(target_block):
-                seq_j = target_block[seq_br]
-                seq_raw = float(row[seq_j]) if seq_j < len(row) else 0.0
-                if seq_raw < 40.0:
-                    for br, ep_j in enumerate(target_block):
-                        if br in used_block:
-                            continue
-                        raw = float(row[ep_j]) if ep_j < len(row) else 0.0
-                        if raw >= seq_raw + 25.0:
-                            adj = raw - order_penalty * abs(br - rank)
-                            if best is None or adj > best[0]:
-                                best = (adj, br, ep_j)
-
-        if best is None:
-            continue
-        _adj, br, ep_j = best
-        used_block.add(br)
-        raw = float(score_matrix[file_i][ep_j])
-        sequential = br == rank
+            ep_j = max(
+                leftovers,
+                key=lambda j: float(row[j]) if j < len(row) else 0.0,
+            )
+            raw = float(row[ep_j]) if ep_j < len(row) else 0.0
+            sequential = False
+        claimed_ep_j.add(ep_j)
         assignment[file_i] = (ep_j, raw, sequential)
-
-    # Hole repair: if assignments skip one episode inside the block, slide later ones
-    # Build list of (rank, file_i, ep_num)
-    assigned_list = []
-    for rank, file_i in enumerate(assignable):
-        if file_i not in assignment:
-            continue
-        ep_j, sc, seq = assignment[file_i]
-        assigned_list.append((rank, file_i, episodes[ep_j].episode, ep_j, sc, seq))
-    # If we have a clean block start but a hole (e.g. E01-E04 then E06), force re-map ranks to block
-    if len(assignment) == len(assignable) and len(target_block) >= len(assignable):
-        # Force pure sequential onto target_block when most ranks already sequential
-        n_seq = sum(1 for _r, _f, _e, _j, _s, seq in assigned_list if seq)
-        if n_seq >= max(2, len(assignable) - 2):
-            # Re-bind strictly: file rank i → target_block[i]
-            for rank, file_i in enumerate(assignable):
-                if rank >= len(target_block):
-                    break
-                ep_j = target_block[rank]
-                raw = float(score_matrix[file_i][ep_j]) if ep_j < len(score_matrix[file_i]) else 50.0
-                assignment[file_i] = (ep_j, raw, True)
 
     for file_i, (ep_j, sc, sequential) in assignment.items():
         ep = episodes[ep_j]
@@ -672,20 +623,27 @@ def reassign_sequential_disc(
         r.episode = ep.episode
         r.title = ep.title
         dialogue_conf = max(0.0, min(100.0, float(sc)))
-        # Layout confidence: sequential slots are layout-strong
-        layout_conf = 88.0 if sequential else 78.0
-        # Blend so forced sequential doesn't look like random ~55 when dialogue is weak
-        if sequential:
-            blended = 0.55 * dialogue_conf + 0.45 * layout_conf
-        else:
-            blended = 0.70 * dialogue_conf + 0.30 * layout_conf
+        layout_conf = 90.0 if sequential else 80.0
+        # Layout-backed blend: correct order shouldn't look like a coin-flip
+        blended = (
+            0.50 * dialogue_conf + 0.50 * layout_conf
+            if sequential
+            else 0.70 * dialogue_conf + 0.30 * layout_conf
+        )
         r.confidence = round(max(0.0, min(100.0, blended)), 1)
         r.low_confidence = dialogue_conf < low_threshold
         r.error = None
         flags = [
             f
             for f in r.flags
-            if f not in {"duplicate_claim", "low_confidence", "review", "no_match"}
+            if f
+            not in {
+                "duplicate_claim",
+                "low_confidence",
+                "review",
+                "no_match",
+                "reassigned_global",
+            }
         ]
         if "assigned_unique" not in flags:
             flags.append("assigned_unique")
@@ -693,17 +651,11 @@ def reassign_sequential_disc(
             flags.append("sequential_disc")
         if sequential and "sequential_prior" not in flags:
             flags.append("sequential_prior")
-        # Select: layout-backed sequential can be selected even if dialogue mid
-        if dialogue_conf >= auto_threshold or (sequential and dialogue_conf >= 45):
-            pass  # will select via build_plan thresholds using blended conf
-        if dialogue_conf < low_threshold and sequential:
+        if dialogue_conf < low_threshold:
             flags.append("review")
-        elif blended < auto_threshold and blended >= low_threshold:
+        elif blended < auto_threshold:
             flags.append("review")
-        elif blended < low_threshold:
-            flags.append("low_confidence")
         r.flags = flags
-        # Stash dialogue-only conf for tooltips via track_info suffix if empty
         if r.track_info and "dlg=" not in (r.track_info or ""):
             r.track_info = f"{r.track_info} dlg={dialogue_conf:.0f}"
         elif not r.track_info:

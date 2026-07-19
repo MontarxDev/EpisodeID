@@ -703,7 +703,8 @@ def reassign_demoted_to_free_slots(
             if "duplicate_global" not in r.flags:
                 taken.add((int(r.season), int(r.episode)))
 
-    # Candidates: demoted or wrong-id unselected with usable dialogue
+    # Candidates: demoted / unselected with dialogue — never re-open sequential_disc
+    # rows that already hold a layout-backed identity (prevents E05 landing on S5_D3).
     cand_idx: list[int] = []
     for i, r in enumerate(rows):
         if getattr(r, "row_kind", "rename") == "inventory_skip":
@@ -712,11 +713,13 @@ def reassign_demoted_to_free_slots(
             continue
         if "likely_extra" in r.flags:
             continue
+        if "sequential_disc" in r.flags and r.season is not None:
+            continue
         if r.error and "no_english" in (r.error or "").lower():
             continue
         if not (r.dialogue_lines or r.sample_quality >= 40):
             continue
-        if "duplicate_global" in r.flags or r.season is not None or r.confidence >= 40:
+        if "duplicate_global" in r.flags or r.season is None or r.confidence >= 40:
             cand_idx.append(i)
 
     if not cand_idx or not catalog:
